@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
@@ -15,7 +16,8 @@ const SECRET_SPECS = [
   }
 ]
 
-const wranglerCli = join(process.cwd(), '..', '..', 'node_modules', 'wrangler', 'wrangler-dist', 'cli.js')
+const require = createRequire(import.meta.url)
+const wranglerCli = require.resolve('wrangler/wrangler-dist/cli.js')
 
 const runWrangler = (args = []) => {
   return spawnSync(process.execPath, [wranglerCli, ...args], {
