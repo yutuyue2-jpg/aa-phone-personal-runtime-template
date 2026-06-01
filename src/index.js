@@ -856,18 +856,18 @@ const handleClaim = async (request, env) => {
   const expected = trimText(env.SETUP_SECRET)
   if (!expected) throw Object.assign(new Error('missing_setup_secret'), { status: 500 })
   const owner = await getOwnerUser(env)
-  if (owner?.owner_token_hash) throw Object.assign(new Error('setup_already_claimed'), { status: 409 })
   if (trimText(body.setupSecret) !== expected) throw Object.assign(new Error('invalid_setup_secret'), { status: 403 })
   const token = randomToken()
   await upsertOwnerUser(env, {
     owner_token_hash: await sha256Hex(token),
-    setup_claimed_at: nowMs()
+    setup_claimed_at: Number(owner?.setup_claimed_at || 0) || nowMs()
   })
   return json({
     ok: true,
     token,
     userId: OWNER_USER_ID,
-    runtimeMode: 'cloud'
+    runtimeMode: 'cloud',
+    reclaimed: Boolean(owner?.owner_token_hash)
   })
 }
 

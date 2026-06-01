@@ -15,16 +15,10 @@ const SECRET_SPECS = [
   }
 ]
 
-const npxBin = process.platform === 'win32' ? 'npx.cmd' : 'npx'
-
-const quoteWindowsArg = (value = '') => `"${String(value).replace(/"/g, '\\"')}"`
+const wranglerCli = join(process.cwd(), '..', '..', 'node_modules', 'wrangler', 'wrangler-dist', 'cli.js')
 
 const runWrangler = (args = []) => {
-  const command = process.platform === 'win32' ? process.env.ComSpec || 'cmd.exe' : npxBin
-  const commandArgs = process.platform === 'win32'
-    ? ['/d', '/s', '/c', [quoteWindowsArg(npxBin), ...args.map(quoteWindowsArg)].join(' ')]
-    : args
-  return spawnSync(command, commandArgs, {
+  return spawnSync(process.execPath, [wranglerCli, ...args], {
     encoding: 'utf8',
     shell: false
   })
@@ -43,7 +37,7 @@ const parseSecretList = (stdout = '') => {
   }
 }
 
-const listResult = runWrangler(['wrangler', 'secret', 'list'])
+const listResult = runWrangler(['secret', 'list'])
 if (listResult.stdout) process.stdout.write(listResult.stdout)
 if (listResult.stderr) process.stderr.write(listResult.stderr)
 if (listResult.error) {
@@ -86,7 +80,7 @@ try {
     'utf8'
   )
   console.log(`Uploading missing Worker secrets: ${missingSecrets.map((item) => item.name).join(', ')}`)
-  const bulkResult = runWrangler(['wrangler', 'secret', 'bulk', secretFile])
+  const bulkResult = runWrangler(['secret', 'bulk', secretFile])
   if (bulkResult.stdout) process.stdout.write(bulkResult.stdout)
   if (bulkResult.stderr) process.stderr.write(bulkResult.stderr)
   if (bulkResult.error) {
