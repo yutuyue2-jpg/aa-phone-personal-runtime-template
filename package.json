@@ -14,9 +14,6 @@
       "SETUP_SECRET": {
         "description": "从小手机设置页生成的个人云端连接码。部署后回到小手机填写 Worker URL，点击绑定即可换取访问 token。"
       },
-      "AI_API_KEY": {
-        "description": "可选。只保存在你自己的 Cloudflare Worker Secret 里，用于未来让个人云端在后台调用模型。第一阶段也可以继续由 PWA 本地传入 AI 配置。"
-      },
       "WECHAT_ILINK_STATE_SECRET": {
         "description": "微信扫码登录 state 的部署端加密密钥。模板部署时会自动生成并写入，一般不需要手填；只有本地 dev 才需要自己准备。"
       },
