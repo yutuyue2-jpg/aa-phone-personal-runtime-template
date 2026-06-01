@@ -1,0 +1,25 @@
+{
+  "name": "ai-phone-personal-runtime",
+  "main": "src/index.js",
+  "compatibility_date": "2026-06-01",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "workers_dev": true,
+  "triggers": {
+    "crons": [
+      "* * * * *"
+    ]
+  },
+  "vars": {
+    "RUNTIME_VERSION": "0.1.0"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "ai-phone-personal-runtime",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ]
+}
