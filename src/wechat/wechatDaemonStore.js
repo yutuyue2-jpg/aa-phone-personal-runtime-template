@@ -3,7 +3,6 @@ import path from 'node:path'
 
 const STORE_VERSION = 1
 const DEFAULT_STORE_RELATIVE_PATH = path.join('data', 'wechat-daemon-store.json')
-const KV_STORE_KEY = 'wechat-daemon-store:v1'
 const THREAD_CONTEXT_MESSAGE_LIMIT = 80
 const THREAD_CONTEXT_MOMENT_LIMIT = 12
 const THREAD_CONTEXT_EVENT_LIMIT = 20
@@ -13,8 +12,6 @@ const THREAD_CONTEXT_WORLD_BOOK_LIMIT = 48
 const RECENT_INBOUND_UPDATE_LIMIT = 40
 
 const normalizeText = (value = '') => String(value || '').trim()
-const REMOTE_DEBUG_EVENT_URL = 'https://ai-phone-background.yutuyue2.workers.dev/debug/event'
-
 const normalizeIdentity = (value = '') => normalizeText(value) === 'sub' ? 'sub' : 'main'
 
 const normalizeBoolean = (value, fallback = false) => {
@@ -103,9 +100,13 @@ const normalizeThreadContextMessage = (message = {}) => {
     translatedText: normalizeText(safe.translatedText),
     transcript: normalizeText(safe.transcript),
     description: normalizeText(safe.description),
+    url: normalizeText(safe.url || safe.mediaUrl),
+    mediaUrl: normalizeText(safe.mediaUrl || safe.url),
+    caption: normalizeText(safe.caption),
     timestamp: Math.max(0, Number(safe.timestamp || 0)),
     amount: normalizeText(safe.amount),
-    status: normalizeText(safe.status)
+    status: normalizeText(safe.status),
+    source: normalizeText(safe.source)
   }
 }
 
@@ -413,12 +414,217 @@ async function ensureParentDir(filePath = '') {
   await fs.mkdir(path.dirname(filePath), { recursive: true })
 }
 
-function hasKvStore(env = process.env) {
-  return Boolean(
-    env?.PROACTIVE_KV
-    && typeof env.PROACTIVE_KV.get === 'function'
-    && typeof env.PROACTIVE_KV.put === 'function'
-  )
+function hasD1Store(env = process.env) {
+  return Boolean(env?.DB && typeof env.DB.prepare === 'function')
+}
+
+const parseJson = (value, fallback) => {
+  if (!value) return fallback
+  try {
+    return JSON.parse(value)
+  } catch {
+    return fallback
+  }
+}
+
+const boolToInt = (value) => value === true ? 1 : 0
+
+const rowToBindingRecord = (row = {}) => normalizeBindingRecord({
+  threadKey: row.thread_key,
+  roleId: row.role_id,
+  accountId: row.account_id,
+  identity: row.identity,
+  chatId: row.chat_id,
+  wechatReplyTriggersAi: row.wechat_reply_triggers_ai !== 0,
+  pwaChatToWechat: row.pwa_chat_to_wechat === 1,
+  quietSeconds: row.quiet_seconds,
+  status: row.status,
+  bridgeType: row.bridge_type,
+  bridgeUrl: row.bridge_url,
+  bindingId: row.binding_id,
+  remoteBindingId: row.remote_binding_id,
+  sessionId: row.session_id,
+  externalAccountId: row.external_account_id,
+  externalAccountName: row.external_account_name,
+  lastError: row.last_error,
+  lastLoginStartedAt: row.last_login_started_at,
+  lastStatusCheckedAt: row.last_status_checked_at,
+  lastSyncedAt: row.last_synced_at,
+  lastSentAt: row.last_sent_at,
+  lastInboundAt: row.last_inbound_at,
+  lastInboundFrom: row.last_inbound_from,
+  lastInboundContextToken: row.last_inbound_context_token,
+  quietUntilAt: row.quiet_until_at,
+  autoReplyState: row.auto_reply_state,
+  lastAutoReplyReadyAt: row.last_auto_reply_ready_at,
+  lastAutoReplyStartedAt: row.last_auto_reply_started_at,
+  lastAutoReplyQueuedAt: row.last_auto_reply_queued_at,
+  lastAutoReplyCompletedAt: row.last_auto_reply_completed_at,
+  nextAutoReplyAttemptAt: row.next_auto_reply_attempt_at,
+  autoReplyAttemptCount: row.auto_reply_attempt_count,
+  autoReplyLastError: row.auto_reply_last_error,
+  threadContextSnapshot: parseJson(row.snapshot_json, {}),
+  threadContextUpdatedAt: row.thread_context_updated_at || row.context_updated_at,
+  recentInboundUpdates: parseJson(row.recent_inbound_updates_json, []),
+  pendingInboundUpdates: parseJson(row.pending_inbound_updates_json, []),
+  processingInboundUpdates: parseJson(row.processing_inbound_updates_json, []),
+  createdAt: row.created_at,
+  updatedAt: row.updated_at
+})
+
+const selectBindingSql = `
+  SELECT
+    b.*,
+    c.snapshot_json,
+    c.updated_at AS context_updated_at
+  FROM wechat_daemon_bindings b
+  LEFT JOIN wechat_thread_contexts c ON c.thread_key = b.thread_key
+`
+
+const readD1BindingRecord = async (env = process.env, threadKey = '') => {
+  const safeThreadKey = normalizeText(threadKey)
+  if (!safeThreadKey) return null
+  const row = await env.DB
+    .prepare(`${selectBindingSql} WHERE b.thread_key = ?`)
+    .bind(safeThreadKey)
+    .first()
+  return row ? rowToBindingRecord(row) : null
+}
+
+const listD1BindingRecords = async (env = process.env) => {
+  const result = await env.DB
+    .prepare(`${selectBindingSql} ORDER BY b.updated_at DESC`)
+    .all()
+  return (result?.results || []).map((row) => rowToBindingRecord(row)).filter((item) => item.threadKey)
+}
+
+const upsertD1BindingRecord = async (env = process.env, record = {}) => {
+  const binding = normalizeBindingRecord(record)
+  if (!binding.threadKey) return null
+  await env.DB.prepare(`
+    INSERT INTO wechat_daemon_bindings (
+      thread_key, role_id, account_id, identity, chat_id,
+      wechat_reply_triggers_ai, pwa_chat_to_wechat, quiet_seconds,
+      status, bridge_type, bridge_url, binding_id, remote_binding_id, session_id,
+      external_account_id, external_account_name, last_error,
+      last_login_started_at, last_status_checked_at, last_synced_at, last_sent_at,
+      last_inbound_at, last_inbound_from, last_inbound_context_token,
+      quiet_until_at, auto_reply_state, last_auto_reply_ready_at, last_auto_reply_started_at,
+      last_auto_reply_queued_at, last_auto_reply_completed_at, next_auto_reply_attempt_at,
+      auto_reply_attempt_count, auto_reply_last_error, thread_context_updated_at,
+      recent_inbound_updates_json, pending_inbound_updates_json, pending_inbound_count,
+      processing_inbound_updates_json, processing_inbound_count, created_at, updated_at
+    ) VALUES (
+      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+    )
+    ON CONFLICT(thread_key) DO UPDATE SET
+      role_id = excluded.role_id,
+      account_id = excluded.account_id,
+      identity = excluded.identity,
+      chat_id = excluded.chat_id,
+      wechat_reply_triggers_ai = excluded.wechat_reply_triggers_ai,
+      pwa_chat_to_wechat = excluded.pwa_chat_to_wechat,
+      quiet_seconds = excluded.quiet_seconds,
+      status = excluded.status,
+      bridge_type = excluded.bridge_type,
+      bridge_url = excluded.bridge_url,
+      binding_id = excluded.binding_id,
+      remote_binding_id = excluded.remote_binding_id,
+      session_id = excluded.session_id,
+      external_account_id = excluded.external_account_id,
+      external_account_name = excluded.external_account_name,
+      last_error = excluded.last_error,
+      last_login_started_at = excluded.last_login_started_at,
+      last_status_checked_at = excluded.last_status_checked_at,
+      last_synced_at = excluded.last_synced_at,
+      last_sent_at = excluded.last_sent_at,
+      last_inbound_at = excluded.last_inbound_at,
+      last_inbound_from = excluded.last_inbound_from,
+      last_inbound_context_token = excluded.last_inbound_context_token,
+      quiet_until_at = excluded.quiet_until_at,
+      auto_reply_state = excluded.auto_reply_state,
+      last_auto_reply_ready_at = excluded.last_auto_reply_ready_at,
+      last_auto_reply_started_at = excluded.last_auto_reply_started_at,
+      last_auto_reply_queued_at = excluded.last_auto_reply_queued_at,
+      last_auto_reply_completed_at = excluded.last_auto_reply_completed_at,
+      next_auto_reply_attempt_at = excluded.next_auto_reply_attempt_at,
+      auto_reply_attempt_count = excluded.auto_reply_attempt_count,
+      auto_reply_last_error = excluded.auto_reply_last_error,
+      thread_context_updated_at = excluded.thread_context_updated_at,
+      recent_inbound_updates_json = excluded.recent_inbound_updates_json,
+      pending_inbound_updates_json = excluded.pending_inbound_updates_json,
+      pending_inbound_count = excluded.pending_inbound_count,
+      processing_inbound_updates_json = excluded.processing_inbound_updates_json,
+      processing_inbound_count = excluded.processing_inbound_count,
+      updated_at = excluded.updated_at
+  `).bind(
+    binding.threadKey,
+    binding.roleId,
+    binding.accountId,
+    binding.identity,
+    binding.chatId,
+    boolToInt(binding.wechatReplyTriggersAi),
+    boolToInt(binding.pwaChatToWechat),
+    binding.quietSeconds,
+    binding.status,
+    binding.bridgeType,
+    binding.bridgeUrl,
+    binding.bindingId,
+    binding.remoteBindingId,
+    binding.sessionId,
+    binding.externalAccountId,
+    binding.externalAccountName,
+    binding.lastError,
+    binding.lastLoginStartedAt,
+    binding.lastStatusCheckedAt,
+    binding.lastSyncedAt,
+    binding.lastSentAt,
+    binding.lastInboundAt,
+    binding.lastInboundFrom,
+    binding.lastInboundContextToken,
+    binding.quietUntilAt,
+    binding.autoReplyState,
+    binding.lastAutoReplyReadyAt,
+    binding.lastAutoReplyStartedAt,
+    binding.lastAutoReplyQueuedAt,
+    binding.lastAutoReplyCompletedAt,
+    binding.nextAutoReplyAttemptAt,
+    binding.autoReplyAttemptCount,
+    binding.autoReplyLastError,
+    binding.threadContextUpdatedAt,
+    JSON.stringify(binding.recentInboundUpdates),
+    JSON.stringify(binding.pendingInboundUpdates),
+    binding.pendingInboundCount,
+    JSON.stringify(binding.processingInboundUpdates),
+    binding.processingInboundCount,
+    binding.createdAt,
+    binding.updatedAt
+  ).run()
+
+  await env.DB.prepare(`
+    INSERT INTO wechat_thread_contexts (thread_key, snapshot_json, updated_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(thread_key) DO UPDATE SET
+      snapshot_json = excluded.snapshot_json,
+      updated_at = excluded.updated_at
+  `).bind(
+    binding.threadKey,
+    JSON.stringify(binding.threadContextSnapshot),
+    binding.threadContextUpdatedAt || binding.updatedAt
+  ).run()
+
+  return readD1BindingRecord(env, binding.threadKey)
+}
+
+const removeD1BindingRecord = async (env = process.env, threadKey = '') => {
+  const safeThreadKey = normalizeText(threadKey)
+  if (!safeThreadKey) return false
+  const existing = await readD1BindingRecord(env, safeThreadKey)
+  if (!existing?.threadKey) return false
+  await env.DB.prepare('DELETE FROM wechat_thread_contexts WHERE thread_key = ?').bind(safeThreadKey).run()
+  await env.DB.prepare('DELETE FROM wechat_daemon_bindings WHERE thread_key = ?').bind(safeThreadKey).run()
+  return true
 }
 
 async function readStoreFile(filePath = '') {
@@ -453,16 +659,11 @@ async function writeStoreFile(filePath = '', data = {}) {
 }
 
 async function readStoreData(env = process.env, filePath = '') {
-  if (hasKvStore(env)) {
-    const raw = await env.PROACTIVE_KV.get(KV_STORE_KEY)
-    if (!raw) return createEmptyStoreData()
-    const parsed = JSON.parse(raw)
-    const bindings = Array.isArray(parsed?.bindings)
-      ? parsed.bindings.map((item) => normalizeBindingRecord(item)).filter((item) => item.threadKey)
-      : []
+  if (hasD1Store(env)) {
+    const bindings = await listD1BindingRecords(env)
     return {
       version: STORE_VERSION,
-      updatedAt: Math.max(0, Number(parsed?.updatedAt || 0)),
+      updatedAt: bindings.reduce((max, item) => Math.max(max, Number(item.updatedAt || 0)), 0),
       bindings
     }
   }
@@ -470,26 +671,30 @@ async function readStoreData(env = process.env, filePath = '') {
 }
 
 async function writeStoreData(env = process.env, filePath = '', data = {}) {
-  if (hasKvStore(env)) {
-    const payload = {
+  if (hasD1Store(env)) {
+    const bindings = Array.isArray(data?.bindings)
+      ? data.bindings.map((item) => normalizeBindingRecord(item)).filter((item) => item.threadKey)
+      : []
+    for (const binding of bindings) {
+      await upsertD1BindingRecord(env, binding)
+    }
+    return {
       version: STORE_VERSION,
       updatedAt: Date.now(),
-      bindings: Array.isArray(data?.bindings) ? data.bindings.map((item) => normalizeBindingRecord(item)) : []
+      bindings
     }
-    await env.PROACTIVE_KV.put(KV_STORE_KEY, JSON.stringify(payload))
-    return payload
   }
   return writeStoreFile(filePath, data)
 }
 
 export function createWechatDaemonStore(env = process.env) {
   const filePath = resolveStorePath(env)
-  const storageLabel = hasKvStore(env) ? `kv:${KV_STORE_KEY}` : filePath
+  const storageLabel = hasD1Store(env) ? 'd1:wechat_daemon_bindings' : filePath
   let cache = null
   let pendingWrite = Promise.resolve()
 
   const load = async (force = false) => {
-    if (!force && cache && !hasKvStore(env)) return cache
+    if (!force && cache && !hasD1Store(env)) return cache
     cache = await readStoreData(env, filePath)
     return cache
   }
@@ -509,6 +714,7 @@ export function createWechatDaemonStore(env = process.env) {
   const getBindingByThreadKey = async (threadKey = '') => {
     const safeThreadKey = normalizeText(threadKey)
     if (!safeThreadKey) return null
+    if (hasD1Store(env)) return readD1BindingRecord(env, safeThreadKey)
     const bindings = await listBindings()
     return bindings.find((item) => item.threadKey === safeThreadKey) || null
   }
@@ -516,6 +722,17 @@ export function createWechatDaemonStore(env = process.env) {
   const upsertBinding = async (input = {}) => {
     const nextRecord = normalizeBindingRecord(input)
     if (!nextRecord.threadKey) return null
+    if (hasD1Store(env)) {
+      const existing = await readD1BindingRecord(env, nextRecord.threadKey)
+      const merged = normalizeBindingRecord({
+        ...(existing || {}),
+        ...nextRecord,
+        createdAt: existing?.createdAt || nextRecord.createdAt || Date.now(),
+        updatedAt: Date.now()
+      })
+      cache = null
+      return upsertD1BindingRecord(env, merged)
+    }
     const current = await load()
     const index = current.bindings.findIndex((item) => item.threadKey === nextRecord.threadKey)
     if (index >= 0) {
@@ -570,30 +787,6 @@ export function createWechatDaemonStore(env = process.env) {
       quietUntilAt,
       now
     })
-    // #region debug-point A:store-inbound-state
-    fetch(REMOTE_DEBUG_EVENT_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        sessionId: 'wechat-sync-lag',
-        runId: 'pre-fix',
-        hypothesisId: 'H2',
-        location: 'server/wechatDaemonStore.js:appendInboundUpdates',
-        msg: '[DEBUG] daemon store appended inbound updates',
-        data: {
-          threadKey: normalizedMeta.threadKey,
-          pendingInboundCount: mergedUpdates.length,
-          quietSeconds,
-          quietUntilAt,
-          autoReplyState,
-          latestInboundFrom: normalizeText(latestInbound?.from),
-          latestInboundId: normalizeText(latestInbound?.id),
-          hasContextToken: !!normalizeText(latestInbound?.contextToken)
-        },
-        ts: Date.now()
-      })
-    }).catch(() => {})
-    // #endregion
     return upsertBinding({
       ...(existing || {}),
       ...normalizedMeta,
@@ -637,26 +830,6 @@ export function createWechatDaemonStore(env = process.env) {
   const markAutoReplyReady = async (threadKey = '') => {
     const existing = await getBindingByThreadKey(threadKey)
     if (!existing?.threadKey) return null
-    // #region debug-point A:mark-ready
-    fetch(REMOTE_DEBUG_EVENT_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        sessionId: 'wechat-sync-lag',
-        runId: 'pre-fix',
-        hypothesisId: 'H2',
-        location: 'server/wechatDaemonStore.js:markAutoReplyReady',
-        msg: '[DEBUG] daemon thread marked ready',
-        data: {
-          threadKey: existing.threadKey,
-          pendingInboundCount: Number(existing.pendingInboundCount || 0),
-          quietUntilAt: Number(existing.quietUntilAt || 0),
-          previousState: normalizeText(existing.autoReplyState || '')
-        },
-        ts: Date.now()
-      })
-    }).catch(() => {})
-    // #endregion
     return upsertBinding({
       ...existing,
       autoReplyState: existing.pendingInboundCount > 0 ? 'ready' : 'idle',
@@ -671,29 +844,6 @@ export function createWechatDaemonStore(env = process.env) {
     if (normalizeAutoReplyState(existing.autoReplyState) !== 'ready') return null
     const claimedUpdates = normalizeInboundUpdates(existing.pendingInboundUpdates)
     if (!claimedUpdates.length) return null
-    // #region debug-point A:claim-ready-thread
-    fetch(REMOTE_DEBUG_EVENT_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        sessionId: 'wechat-sync-lag',
-        runId: 'pre-fix',
-        hypothesisId: 'H2',
-        location: 'server/wechatDaemonStore.js:claimAutoReplyThread',
-        msg: '[DEBUG] daemon claimed ready thread',
-        data: {
-          threadKey: existing.threadKey,
-          pendingInboundCount: claimedUpdates.length,
-          lastInboundFrom: normalizeText(existing.lastInboundFrom),
-          lastInboundContextToken: normalizeText(existing.lastInboundContextToken),
-          firstClaimedUpdateId: normalizeText(claimedUpdates[0]?.id),
-          lastClaimedUpdateId: normalizeText(claimedUpdates[claimedUpdates.length - 1]?.id),
-          hasContextToken: !!normalizeText(existing.lastInboundContextToken)
-        },
-        ts: Date.now()
-      })
-    }).catch(() => {})
-    // #endregion
     return upsertBinding({
       ...existing,
       pendingInboundUpdates: [],
@@ -764,6 +914,18 @@ export function createWechatDaemonStore(env = process.env) {
   const removeBinding = async (threadMeta = {}, options = {}) => {
     const normalizedMeta = normalizeWechatDaemonThreadMeta(threadMeta)
     const safeBindingId = normalizeText(options.bindingId)
+    if (hasD1Store(env)) {
+      if (normalizedMeta.threadKey) {
+        cache = null
+        return removeD1BindingRecord(env, normalizedMeta.threadKey)
+      }
+      if (!safeBindingId) return false
+      const bindings = await listD1BindingRecords(env)
+      const matched = bindings.find((item) => normalizeText(item.bindingId) === safeBindingId)
+      if (!matched?.threadKey) return false
+      cache = null
+      return removeD1BindingRecord(env, matched.threadKey)
+    }
     const current = await load()
     const before = current.bindings.length
     current.bindings = current.bindings.filter((item) => {

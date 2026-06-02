@@ -55,6 +55,16 @@
 - `roles`
 - `conversations`
 - `messages`
-- `runtime_kv`
+- `runtime_settings`
+- `background_devices`
+- `background_snapshots`
+- `background_ai_keys`
+- `push_subscriptions`
+- `background_pending_messages`
+- `background_runtime_states`
+- `background_activities`
+- `wechat_daemon_bindings`
+- `wechat_thread_contexts`
+- `wechat_outbox_messages`
 
 后台主动消息、Web Push pending 队列、投递回执、微信 Bridge 代理、微信 outbox 和 daemon 轮询已经收口到这个个人 Runtime。图片/语音/表情等媒体投递会在后续阶段继续增强。

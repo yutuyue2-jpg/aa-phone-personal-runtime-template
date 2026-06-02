@@ -1,4 +1,25 @@
 import webpush from 'web-push'
+import {
+  ackPendingMessages,
+  appendPendingMessage,
+  deleteBackgroundAiKeyPayload,
+  deletePushSubscription,
+  getBackgroundActivity,
+  getBackgroundAiKeyPayload,
+  getBackgroundSnapshot,
+  getBackgroundState,
+  getPendingMessages,
+  getPushSubscription,
+  getRuntimeSetting,
+  listBackgroundDeviceIds,
+  putBackgroundActivity,
+  putBackgroundAiKeyPayload,
+  putBackgroundSnapshot,
+  putBackgroundState,
+  putPushSubscription,
+  putRuntimeSetting,
+  registerBackgroundDevice,
+} from './backgroundRuntimeStore.js'
 import { handleWechatBridgeProxy } from './wechat/wechatBridgeProxy.js'
 import { createWechatDaemonAutoReplyHandler } from './wechat/wechatDaemonAutoReplyHandler.js'
 import { createWechatDaemonRuntime } from './wechat/wechatDaemonRuntime.js'
@@ -22,14 +43,7 @@ const MAX_DEVICES_PER_CRON = 80
 const DEFAULT_MAX_GENERATIONS_PER_CRON = 8
 const PROACTIVE_PENDING_LIMIT = SHARED_PROACTIVE_PENDING_LIMIT
 const MAX_INTERNAL_CHAT_MESSAGES = 64
-const DEVICE_INDEX_KEY = 'devices:index'
-const VAPID_KEYPAIR_KEY = 'vapid:keypair'
-const SNAPSHOT_PREFIX = 'snapshot:'
-const SUBSCRIPTION_PREFIX = 'subscription:'
-const KEY_PREFIX = 'background-ai:'
-const PENDING_PREFIX = 'pending:'
-const STATE_PREFIX = 'state:'
-const ACTIVITY_PREFIX = 'activity:'
+const VAPID_SETTING_KEY = 'vapid:keypair'
 const ENCRYPTED_PAYLOAD_VERSION = 1
 
 const json = (payload = {}, init = {}) => new Response(JSON.stringify(payload), {
@@ -271,75 +285,6 @@ const safeJson = (value, fallback) => {
   }
 }
 
-const getRuntimeValue = async (env, key, fallback = null) => {
-  const safeKey = String(key || '').trim()
-  if (!safeKey) return fallback
-  const row = await env.DB
-    .prepare('SELECT value_json FROM runtime_kv WHERE key = ?')
-    .bind(safeKey)
-    .first()
-  return safeJson(row?.value_json, fallback)
-}
-
-const putRuntimeValue = async (env, key, value) => {
-  const safeKey = String(key || '').trim()
-  if (!safeKey) return null
-  const now = nowMs()
-  await env.DB
-    .prepare(`
-      INSERT INTO runtime_kv (key, value_json, created_at, updated_at)
-      VALUES (?, ?, ?, ?)
-      ON CONFLICT(key) DO UPDATE SET
-        value_json = excluded.value_json,
-        updated_at = excluded.updated_at
-    `)
-    .bind(safeKey, JSON.stringify(value), now, now)
-    .run()
-  return value
-}
-
-const deleteRuntimeValue = async (env, key) => {
-  const safeKey = String(key || '').trim()
-  if (!safeKey) return
-  await env.DB.prepare('DELETE FROM runtime_kv WHERE key = ?').bind(safeKey).run()
-}
-
-const D1_KV_PREFIX = 'compat-kv:'
-
-const createD1KvAdapter = (env) => ({
-  async get(key) {
-    const value = await getRuntimeValue(env, `${D1_KV_PREFIX}${key}`, null)
-    if (value == null) return null
-    return typeof value === 'string' ? value : JSON.stringify(value)
-  },
-  async put(key, value) {
-    const text = String(value ?? '')
-    let parsed = text
-    try {
-      parsed = JSON.parse(text)
-    } catch {
-      parsed = text
-    }
-    await putRuntimeValue(env, `${D1_KV_PREFIX}${key}`, parsed)
-  },
-  async delete(key) {
-    await deleteRuntimeValue(env, `${D1_KV_PREFIX}${key}`)
-  }
-})
-
-const createWechatRuntimeEnv = (env) => ({
-  ...env,
-  PROACTIVE_KV: createD1KvAdapter(env)
-})
-
-const registerDevice = async (env, deviceId) => {
-  const id = safeId(deviceId)
-  if (!id) return
-  const current = await getRuntimeValue(env, DEVICE_INDEX_KEY, [])
-  const next = Array.from(new Set([...(Array.isArray(current) ? current : []), id])).slice(-2000)
-  await putRuntimeValue(env, DEVICE_INDEX_KEY, next)
-}
-
 const arrayBufferToBase64Url = (buffer) => {
   const bytes = new Uint8Array(buffer)
   let binary = ''
@@ -358,7 +303,7 @@ const exportVapidKeyPair = async (keyPair) => {
 }
 
 const getOrCreateVapidKeyPair = async (env) => {
-  const existing = await getRuntimeValue(env, VAPID_KEYPAIR_KEY, null)
+  const existing = await getRuntimeSetting(env, VAPID_SETTING_KEY, null)
   if (existing?.publicKey && existing?.privateKey) return existing
   const keyPair = await crypto.subtle.generateKey(
     { name: 'ECDSA', namedCurve: 'P-256' },
@@ -366,7 +311,7 @@ const getOrCreateVapidKeyPair = async (env) => {
     ['sign', 'verify']
   )
   const exported = await exportVapidKeyPair(keyPair)
-  await putRuntimeValue(env, VAPID_KEYPAIR_KEY, exported)
+  await putRuntimeSetting(env, VAPID_SETTING_KEY, exported)
   return exported
 }
 
@@ -470,14 +415,63 @@ const buildWechatOutboxThreadMeta = (role = null, thread = null) => {
   }
 }
 
-const splitRenderableWechatTexts = (rawText = '') => String(rawText || '')
-  .replace(/\r/g, '')
-  .split('\n')
-  .map((line) => line.trim())
-  .map((line) => line.replace(/^\s*\[(?:语音|voice)\]\s*/i, '').trim())
-  .filter((line) => line && !/^\[[^\]]+\]$/.test(line) && !/^【[^】]+】$/.test(line))
-  .filter((line) => !/^\[(?:表情|sticker|image|图片)\s*[:：][^\]]*\]$/i.test(line))
-  .slice(0, 8)
+const isWechatMediaUrl = (value = '') => /^https?:\/\//i.test(trimText(value, 1000))
+
+const getStickerTokenCandidates = (sticker = {}) => [
+  sticker?.token,
+  sticker?.name,
+  sticker?.desc,
+  sticker?.description
+]
+  .map((item) => trimText(item, 120).toLowerCase())
+  .filter(Boolean)
+
+const resolveStickerMediaUrl = (role = {}, stickerName = '') => {
+  const safeName = trimText(stickerName, 120).toLowerCase()
+  if (!safeName) return ''
+  const stickers = Array.isArray(role?.stickers) ? role.stickers : []
+  const matched = stickers.find((sticker) => getStickerTokenCandidates(sticker).includes(safeName))
+  const url = trimText(matched?.url || matched?.mediaUrl || matched?.imageUrl || '', 1000)
+  return isWechatMediaUrl(url) ? url : ''
+}
+
+const buildRenderableWechatItems = (rawText = '', role = {}) => {
+  const lines = String(rawText || '')
+    .replace(/\r/g, '')
+    .split('\n')
+    .map((line) => line.trim())
+    .map((line) => line.replace(/^\s*\[(?:语音|voice)[^\]]*\]\s*/i, '').trim())
+
+  const items = []
+  for (const line of lines) {
+    if (!line) continue
+
+    const stickerMatch = line.match(/^\[(?:表情|sticker)\s*[:：]\s*([^\]]+)\]$/i)
+    if (stickerMatch) {
+      const stickerName = trimText(stickerMatch[1], 120)
+      const mediaUrl = resolveStickerMediaUrl(role, stickerName)
+      items.push(mediaUrl
+        ? { type: 'image', content: line, caption: '', mediaUrl }
+        : { type: 'text', content: line })
+      continue
+    }
+
+    const imageMatch = line.match(/^\[(?:image|图片)\s*[:：]\s*([^\]]+)\]$/i)
+    if (imageMatch) {
+      const mediaUrl = trimText(imageMatch[1], 1000)
+      items.push(isWechatMediaUrl(mediaUrl)
+        ? { type: 'image', content: '[图片]', caption: '', mediaUrl }
+        : { type: 'text', content: line })
+      continue
+    }
+
+    if (/^【[^】]+】$/.test(line)) continue
+    if (/^\[[^\]]+\]$/.test(line)) continue
+    items.push({ type: 'text', content: line })
+  }
+
+  return items.slice(0, 8)
+}
 
 const formatPendingRelativeTime = (timestamp = 0, now = Date.now()) => {
   const ts = Number(timestamp || 0)
@@ -557,10 +551,7 @@ const buildMessageForRole = ({ role, rawText }) => {
 }
 
 const appendPending = async (env, deviceId, message) => {
-  const key = `${PENDING_PREFIX}${deviceId}`
-  const current = await getRuntimeValue(env, key, [])
-  const next = [...(Array.isArray(current) ? current : []), message].slice(-PROACTIVE_PENDING_LIMIT)
-  await putRuntimeValue(env, key, next)
+  await appendPendingMessage(env, deviceId, message, PROACTIVE_PENDING_LIMIT)
 }
 
 const getPushPayloadForMessage = (message = {}) => ({
@@ -666,10 +657,9 @@ const runNodeStyleHandler = async (request, handler) => {
 }
 
 const createWechatDaemonRuntimeForWorker = (env) => {
-  const runtimeEnv = createWechatRuntimeEnv(env)
   return createWechatDaemonRuntime({
-    ...runtimeEnv,
-    __WECHAT_DAEMON_AUTO_REPLY_HANDLER__: createWechatDaemonAutoReplyHandler(runtimeEnv)
+    ...env,
+    __WECHAT_DAEMON_AUTO_REPLY_HANDLER__: createWechatDaemonAutoReplyHandler(env)
   })
 }
 
@@ -690,14 +680,18 @@ const handleWechatDaemonRequest = async (request, env, routePath) => {
   return json({ ok: false, error: 'wechat_daemon_route_not_found', path: routePath }, { status: 404 })
 }
 
+const handleWechatDaemonPublicStatusRequest = async (_request, env) => {
+  const runtime = createWechatDaemonRuntimeForWorker(env)
+  return json(await runtime.getPublicStatus())
+}
+
 const handleWechatRequest = async (request, env, ctx = null) => {
   const routePath = getWechatRoutePath(new URL(request.url).pathname)
   if (routePath.startsWith('/wechat/daemon/')) {
     return handleWechatDaemonRequest(request, env, routePath)
   }
-  const runtimeEnv = createWechatRuntimeEnv(env)
   const response = await runNodeStyleHandler(request, (req, res) =>
-    handleWechatBridgeProxy(req, res, runtimeEnv, routePath)
+    handleWechatBridgeProxy(req, res, env, routePath)
   )
   if (
     ['/wechat/sync-now', '/wechat/outbox/enqueue', '/wechat/thread-context', '/wechat/config'].includes(routePath)
@@ -710,8 +704,9 @@ const handleWechatRequest = async (request, env, ctx = null) => {
     })
     if (ctx?.waitUntil) {
       ctx.waitUntil(tickPromise)
-    } else if (routePath === '/wechat/outbox/enqueue') {
-      void tickPromise
+      if (routePath === '/wechat/outbox/enqueue') {
+        await tickPromise
+      }
     } else {
       await tickPromise
     }
@@ -731,30 +726,39 @@ const enqueueWechatOutboxForProactiveMessage = async (env, role = null, pendingM
   const runtime = createWechatDaemonRuntimeForWorker(env)
   const messageId = String(pendingMessage.messageId || '').trim()
   const idempotencyKey = `background_proactive:${threadMeta.accountId}:${threadMeta.identity}:${threadMeta.chatId}:${messageId}`
-  const renderableTexts = splitRenderableWechatTexts(content)
-  const outboxTexts = renderableTexts.length ? renderableTexts : [previewText(content) || content.slice(0, 160)]
+  const renderableItems = buildRenderableWechatItems(content, role)
+  const outboxItems = renderableItems.length
+    ? renderableItems
+    : [{ type: 'text', content: previewText(content) || content.slice(0, 160) }]
   const queuedMessages = []
-  for (let index = 0; index < outboxTexts.length; index += 1) {
-    const itemContent = String(outboxTexts[index] || '').trim()
+  for (let index = 0; index < outboxItems.length; index += 1) {
+    const item = outboxItems[index] && typeof outboxItems[index] === 'object' ? outboxItems[index] : {}
+    const itemContent = String(item.content || '').trim()
     if (!itemContent) continue
     const queued = await runtime.outboxStore.enqueueMessage({
       threadMeta,
       source: 'background_proactive',
+      type: item.type === 'image' ? 'image' : 'text',
       content: itemContent,
+      caption: String(item.caption || '').trim(),
+      mediaUrl: String(item.mediaUrl || '').trim(),
       messageId,
       idempotencyKey: `${idempotencyKey}:${index}`
     })
     if (queued?.id) queuedMessages.push(queued)
   }
-  await runtime.store.appendThreadContextMessages(queuedMessages[0]?.threadKey || threadMeta.threadKey, [{
-    id: messageId,
+  const baseTimestamp = Number(pendingMessage.createdAt || Date.now())
+  await runtime.store.appendThreadContextMessages(queuedMessages[0]?.threadKey || threadMeta.threadKey, outboxItems.map((item, index) => ({
+    id: `${messageId}_${index}`,
     role: 'assistant',
-    type: 'text',
-    text: outboxTexts.join('\n'),
-    originalText: content,
-    timestamp: Number(pendingMessage.createdAt || Date.now()),
+    type: item.type === 'image' ? 'image' : 'text',
+    text: String(item.content || '').trim(),
+    originalText: index === 0 ? content : String(item.content || '').trim(),
+    url: String(item.mediaUrl || '').trim(),
+    mediaUrl: String(item.mediaUrl || '').trim(),
+    timestamp: baseTimestamp + index,
     source: 'background_proactive'
-  }], {
+  })), {
     updatedAt: Number(pendingMessage.createdAt || Date.now())
   }).catch((error) => {
     console.warn('[personal-runtime] append proactive wechat thread context failed', {
@@ -770,6 +774,7 @@ const enqueueWechatOutboxForProactiveMessage = async (env, role = null, pendingM
     enqueued: queuedMessages.length > 0,
     outboxMessageId: queuedMessages[0]?.id || '',
     outboxMessageIds: queuedMessages.map((item) => item.id).filter(Boolean),
+    threadMeta,
     tickResult
   }
 }
@@ -953,13 +958,13 @@ const handleDisconnect = async (request, env) => {
 }
 
 const buildDeviceStatus = async (env, deviceId) => {
-  const snapshot = await getRuntimeValue(env, `${SNAPSHOT_PREFIX}${deviceId}`)
-  const subscription = await getRuntimeValue(env, `${SUBSCRIPTION_PREFIX}${deviceId}`)
-  const storedKeyConfig = await getRuntimeValue(env, `${KEY_PREFIX}${deviceId}`)
+  const snapshot = await getBackgroundSnapshot(env, deviceId)
+  const subscription = await getPushSubscription(env, deviceId)
+  const storedKeyConfig = await getBackgroundAiKeyPayload(env, deviceId)
   const keyConfig = await readBackgroundAiConfig(env, storedKeyConfig).catch(() => null)
-  const pending = await getRuntimeValue(env, `${PENDING_PREFIX}${deviceId}`, [])
-  const state = await getRuntimeValue(env, `${STATE_PREFIX}${deviceId}`, {})
-  const activity = await getRuntimeValue(env, `${ACTIVITY_PREFIX}${deviceId}`, {})
+  const pending = await getPendingMessages(env, deviceId)
+  const state = await getBackgroundState(env, deviceId)
+  const activity = await getBackgroundActivity(env, deviceId)
   const roles = Array.isArray(snapshot?.roles) ? snapshot.roles : []
   return {
     ok: true,
@@ -992,18 +997,17 @@ const buildDeviceStatus = async (env, deviceId) => {
 }
 
 const runDevice = async (env, deviceId, { force = false } = {}) => {
-  const snapshot = await getRuntimeValue(env, `${SNAPSHOT_PREFIX}${deviceId}`)
+  const snapshot = await getBackgroundSnapshot(env, deviceId)
   if (!snapshot?.backgroundAi?.enabled) return { generated: false, reason: 'missing_or_disabled_snapshot' }
-  const subscription = await getRuntimeValue(env, `${SUBSCRIPTION_PREFIX}${deviceId}`)
+  const subscription = await getPushSubscription(env, deviceId)
   if (!subscription) return { generated: false, reason: 'missing_subscription' }
-  const keyConfig = await readBackgroundAiConfig(env, await getRuntimeValue(env, `${KEY_PREFIX}${deviceId}`))
+  const keyConfig = await readBackgroundAiConfig(env, await getBackgroundAiKeyPayload(env, deviceId))
   if (!keyConfig?.apiKey) return { generated: false, reason: 'missing_background_key' }
-  const pendingMessages = await getRuntimeValue(env, `${PENDING_PREFIX}${deviceId}`, [])
+  const pendingMessages = await getPendingMessages(env, deviceId)
 
-  const stateKey = `${STATE_PREFIX}${deviceId}`
-  const state = await getRuntimeValue(env, stateKey, {})
+  const state = await getBackgroundState(env, deviceId)
   const now = nowMs()
-  const activity = await getRuntimeValue(env, `${ACTIVITY_PREFIX}${deviceId}`, {})
+  const activity = await getBackgroundActivity(env, deviceId)
   const appIsForeground = !force && Number(activity?.foregroundUntil || 0) > now
   if (!force && Number(state.nextCheckAt || 0) > now) {
     return { generated: false, reason: 'next_check_not_due' }
@@ -1025,7 +1029,7 @@ const runDevice = async (env, deviceId, { force = false } = {}) => {
   }
   const decision = sharedShouldRunProactiveForRole({ snapshot, role, now, force })
   const nextCheckAt = now + sharedCalculateProactiveDelay(snapshot?.autoMessage || {})
-  await putRuntimeValue(env, stateKey, {
+  await putBackgroundState(env, deviceId, {
     ...state,
     nextCheckAt,
     lastCheckedAt: now,
@@ -1044,10 +1048,23 @@ const runDevice = async (env, deviceId, { force = false } = {}) => {
     error: String(error?.message || error || '')
   }))
   if (wechatOutboxResult?.enqueued) {
+    const outboxThreadMeta = wechatOutboxResult.threadMeta && typeof wechatOutboxResult.threadMeta === 'object'
+      ? wechatOutboxResult.threadMeta
+      : null
+    if (outboxThreadMeta) {
+      pendingMessage.accountId = String(outboxThreadMeta.accountId || '')
+      pendingMessage.identity = String(outboxThreadMeta.identity || '')
+      pendingMessage.chatId = String(outboxThreadMeta.chatId || '')
+    }
     pendingMessage.wechatOutboxEnqueued = true
     pendingMessage.wechatOutboxMessageId = String(wechatOutboxResult.outboxMessageId || '')
     pendingMessage.data = {
       ...(pendingMessage.data || {}),
+      ...(outboxThreadMeta ? {
+        accountId: String(outboxThreadMeta.accountId || ''),
+        identity: String(outboxThreadMeta.identity || ''),
+        chatId: String(outboxThreadMeta.chatId || '')
+      } : {}),
       wechatOutboxEnqueued: true,
       wechatOutboxMessageId: String(wechatOutboxResult.outboxMessageId || '')
     }
@@ -1055,9 +1072,9 @@ const runDevice = async (env, deviceId, { force = false } = {}) => {
   await appendPending(env, deviceId, pendingMessage)
   const pushResult = await sendPush(env, subscription, getPushPayloadForMessage(pendingMessage))
   if (isExpiredSubscriptionStatus(pushResult.status)) {
-    await deleteRuntimeValue(env, `${SUBSCRIPTION_PREFIX}${deviceId}`)
+    await deletePushSubscription(env, deviceId)
   }
-  await putRuntimeValue(env, stateKey, {
+  await putBackgroundState(env, deviceId, {
     ...state,
     nextCheckAt,
     lastCheckedAt: now,
@@ -1075,18 +1092,13 @@ const handleBackgroundAiKey = async (request, env) => {
   const deviceId = safeId(body.deviceId)
   if (!deviceId) return json({ ok: false, error: 'missing_device' }, { status: 400 })
   if (body.enabled !== true) {
-    await deleteRuntimeValue(env, `${KEY_PREFIX}${deviceId}`)
+    await deleteBackgroundAiKeyPayload(env, deviceId)
     return json({ ok: true, deleted: true })
   }
   if (!body.apiKey || !body.baseUrl || !body.model) {
     return json({ ok: false, error: 'missing_key_config' }, { status: 400 })
   }
-  await putRuntimeValue(
-    env,
-    `${KEY_PREFIX}${deviceId}`,
-    await encryptRuntimeJson(env, normalizeBackgroundAiConfig(body))
-  )
-  await registerDevice(env, deviceId)
+  await putBackgroundAiKeyPayload(env, deviceId, await encryptRuntimeJson(env, normalizeBackgroundAiConfig(body)))
   return json({ ok: true })
 }
 
@@ -1098,8 +1110,7 @@ const handleSnapshot = async (request, env) => {
   const body = raw ? JSON.parse(raw) : {}
   const deviceId = safeId(body.deviceId)
   if (!deviceId || !body.snapshot) return json({ ok: false, error: 'missing_device_or_snapshot' }, { status: 400 })
-  const snapshotKey = `${SNAPSHOT_PREFIX}${deviceId}`
-  const currentSnapshot = await getRuntimeValue(env, snapshotKey)
+  const currentSnapshot = await getBackgroundSnapshot(env, deviceId)
   const comparable = (value = {}) => {
     const next = value && typeof value === 'object' ? { ...value } : {}
     delete next.updatedAt
@@ -1107,14 +1118,10 @@ const handleSnapshot = async (request, env) => {
     return JSON.stringify(next)
   }
   if (currentSnapshot && comparable(currentSnapshot) === comparable(body.snapshot)) {
-    await registerDevice(env, deviceId)
+    await registerBackgroundDevice(env, deviceId)
     return json({ ok: true, skipped: true, reason: 'snapshot_unchanged' })
   }
-  await putRuntimeValue(env, snapshotKey, {
-    ...body.snapshot,
-    updatedAt: nowMs()
-  })
-  await registerDevice(env, deviceId)
+  await putBackgroundSnapshot(env, deviceId, body.snapshot)
   return json({ ok: true })
 }
 
@@ -1122,12 +1129,10 @@ const handleActivity = async (request, env) => {
   const body = await readJson(request)
   const deviceId = safeId(body.deviceId)
   if (!deviceId) return json({ ok: false, error: 'missing_device' }, { status: 400 })
-  await putRuntimeValue(env, `${ACTIVITY_PREFIX}${deviceId}`, {
+  await putBackgroundActivity(env, deviceId, {
     state: String(body.state || '').trim(),
-    foregroundUntil: Math.max(0, Number(body.foregroundUntil || 0)),
-    updatedAt: nowMs()
+    foregroundUntil: Math.max(0, Number(body.foregroundUntil || 0))
   })
-  await registerDevice(env, deviceId)
   return json({ ok: true })
 }
 
@@ -1135,8 +1140,7 @@ const handleSubscribe = async (request, env) => {
   const body = await readJson(request)
   const deviceId = safeId(body.deviceId)
   if (!deviceId || !body.subscription) return json({ ok: false, error: 'missing_device_or_subscription' }, { status: 400 })
-  await putRuntimeValue(env, `${SUBSCRIPTION_PREFIX}${deviceId}`, body.subscription)
-  await registerDevice(env, deviceId)
+  await putPushSubscription(env, deviceId, body.subscription)
   return json({ ok: true })
 }
 
@@ -1144,7 +1148,7 @@ const handlePull = async (request, env) => {
   const url = new URL(request.url)
   const deviceId = safeId(url.searchParams.get('deviceId'))
   if (!deviceId) return json({ empty: true, messages: [] })
-  const messages = await getRuntimeValue(env, `${PENDING_PREFIX}${deviceId}`, [])
+  const messages = await getPendingMessages(env, deviceId)
   const safeMessages = Array.isArray(messages) ? messages : []
   if (!safeMessages.length) return json({ empty: true, messages: [] })
   return json({ empty: false, messages: safeMessages })
@@ -1155,10 +1159,8 @@ const handleBackgroundAck = async (request, env) => {
   const deviceId = safeId(body.deviceId)
   const ackIds = new Set((Array.isArray(body.messageIds) ? body.messageIds : [body.messageId]).map((id) => String(id || '')))
   if (!deviceId || !ackIds.size) return json({ ok: false, error: 'missing_device_or_message' }, { status: 400 })
-  const key = `${PENDING_PREFIX}${deviceId}`
-  const current = await getRuntimeValue(env, key, [])
-  const next = (Array.isArray(current) ? current : []).filter((message) => !ackIds.has(String(message.messageId || '')))
-  await putRuntimeValue(env, key, next)
+  await ackPendingMessages(env, deviceId, Array.from(ackIds))
+  const next = await getPendingMessages(env, deviceId)
   return json({ ok: true, remaining: next.length })
 }
 
@@ -1166,15 +1168,13 @@ const handlePushReceipt = async (request, env) => {
   const body = await readJson(request)
   const deviceId = safeId(body.deviceId)
   if (!deviceId) return json({ ok: false, error: 'missing_device' }, { status: 400 })
-  const stateKey = `${STATE_PREFIX}${deviceId}`
-  const state = await getRuntimeValue(env, stateKey, {})
-  await putRuntimeValue(env, stateKey, {
+  const state = await getBackgroundState(env, deviceId)
+  await putBackgroundState(env, deviceId, {
     ...state,
     lastPushReceiptAt: Math.max(0, Number(body.receiptAt || nowMs())),
     lastPushReceiptStage: String(body.stage || 'shown').trim() || 'shown',
     lastPushReceiptMessageId: String(body.messageId || '').trim()
   })
-  await registerDevice(env, deviceId)
   return json({ ok: true })
 }
 
@@ -1183,6 +1183,9 @@ export default {
     if (request.method === 'OPTIONS') return json({ ok: true })
     const url = new URL(request.url)
     try {
+      if (request.method === 'GET' && url.pathname === '/wechat-daemon/public-status') {
+        return handleWechatDaemonPublicStatusRequest(request, env)
+      }
       if (
         url.pathname === '/api'
         || url.pathname === '/wechat'
@@ -1222,7 +1225,7 @@ export default {
         const body = await readJson(request)
         const deviceId = safeId(body.deviceId)
         if (!deviceId) return json({ ok: false, error: 'missing_device' }, { status: 400 })
-        await deleteRuntimeValue(env, `${KEY_PREFIX}${deviceId}`)
+        await deleteBackgroundAiKeyPayload(env, deviceId)
         return json({ ok: true, deleted: true })
       }
       if (request.method === 'POST' && url.pathname === '/snapshot') {
@@ -1267,18 +1270,18 @@ export default {
   async scheduled(_event, env, ctx) {
     ctx.waitUntil((async () => {
       assertDb(env)
-      const devices = await getRuntimeValue(env, DEVICE_INDEX_KEY, [])
+      const devices = await listBackgroundDeviceIds(env, MAX_DEVICES_PER_CRON)
       const maxGenerations = Number(env.MAX_GENERATIONS_PER_CRON || DEFAULT_MAX_GENERATIONS_PER_CRON)
       let generatedCount = 0
-      for (const deviceId of (Array.isArray(devices) ? devices : []).slice(0, MAX_DEVICES_PER_CRON)) {
+      for (const deviceId of (Array.isArray(devices) ? devices : [])) {
         if (generatedCount >= maxGenerations) break
         try {
           const result = await runDevice(env, safeId(deviceId))
           if (result.generated) generatedCount += 1
         } catch (error) {
-          const stateKey = `${STATE_PREFIX}${safeId(deviceId)}`
-          const state = await getRuntimeValue(env, stateKey, {})
-          await putRuntimeValue(env, stateKey, {
+          const safeDeviceId = safeId(deviceId)
+          const state = await getBackgroundState(env, safeDeviceId)
+          await putBackgroundState(env, safeDeviceId, {
             ...state,
             lastCheckedAt: nowMs(),
             lastSkipReason: String(error?.message || error || 'scheduled_run_failed').slice(0, 300)

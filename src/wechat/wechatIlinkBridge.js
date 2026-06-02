@@ -12,6 +12,8 @@ const ILINK_CLIENT_VERSION = '1'
 const SESSION_TTL_MS = 10 * 60 * 1000
 const BINDING_TTL_MS = 30 * 24 * 60 * 60 * 1000
 const ILINK_IMAGE_UPLOAD_MAX_BYTES = 8 * 1024 * 1024
+const RECENT_OUTGOING_CLIENT_ID_LIMIT = 24
+const RECENT_OUTGOING_CLIENT_ID_TTL_MS = 10 * 60 * 1000
 
 const json = (res, payload, status = 200) => {
   res.statusCode = status
@@ -20,7 +22,8 @@ const json = (res, payload, status = 200) => {
 }
 
 const normalizeText = (value = '') => String(value || '').trim()
-const REMOTE_DEBUG_EVENT_URL = 'https://ai-phone-background.yutuyue2.workers.dev/debug/event'
+
+const cloneJson = (value) => JSON.parse(JSON.stringify(value))
 
 const isWechatDaemonStoreDisabled = (env = {}) => ['1', 'true'].includes(
   normalizeText(env.WECHAT_DAEMON_STORE_DISABLED).toLowerCase()
@@ -49,6 +52,67 @@ const getThreadMetaFromInput = (value = null) => normalizeWechatDaemonThreadMeta
   value && typeof value === 'object' ? value : {}
 )
 
+const getThreadContextMessageText = (message = {}) => normalizeText(
+  message?.originalText
+    || message?.text
+    || message?.translatedText
+    || message?.transcript
+    || message?.description
+    || message?.content
+)
+
+const buildThreadContextMessageKey = (message = {}) => [
+  normalizeText(message?.id),
+  normalizeText(message?.role),
+  normalizeText(message?.type || 'text') || 'text',
+  getThreadContextMessageText(message),
+  Math.max(0, Number(message?.timestamp || message?.createdAt || 0))
+].join('|')
+
+const mergeThreadContextMessages = (existing = [], incoming = [], limit = 80) => {
+  const seen = new Set()
+  return [
+    ...(Array.isArray(existing) ? existing : []),
+    ...(Array.isArray(incoming) ? incoming : [])
+  ]
+    .filter((message) => message && typeof message === 'object')
+    .filter((message) => normalizeText(message.id) || getThreadContextMessageText(message))
+    .map((message) => cloneJson(message))
+    .filter((message) => {
+      const key = buildThreadContextMessageKey(message)
+      if (!key || seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+    .sort((left, right) => Number(left?.timestamp || left?.createdAt || 0) - Number(right?.timestamp || right?.createdAt || 0))
+    .slice(-Math.max(1, Number(limit || 80)))
+}
+
+const mergeThreadContextSnapshots = (existing = null, incoming = null) => {
+  const base = existing && typeof existing === 'object' ? existing : {}
+  const next = incoming && typeof incoming === 'object' ? incoming : {}
+  return {
+    ...cloneJson(base),
+    ...cloneJson(next),
+    updatedAt: Math.max(
+      0,
+      Number(base.updatedAt || 0),
+      Number(next.updatedAt || 0),
+      Date.now()
+    ),
+    messages: mergeThreadContextMessages(base.messages, next.messages)
+  }
+}
+
+const listRecentThreadContextMessages = (binding = null, limit = 40) => {
+  const messages = Array.isArray(binding?.threadContextSnapshot?.messages)
+    ? binding.threadContextSnapshot.messages
+    : []
+  return messages
+    .slice(-Math.max(1, Number(limit || 40)))
+    .map((message) => cloneJson(message))
+}
+
 const resolveThreadMeta = (body = {}, state = {}) => {
   const bodyMeta = getThreadMetaFromInput(body?.threadMeta)
   if (bodyMeta.threadKey) return bodyMeta
@@ -75,6 +139,14 @@ const persistWechatDaemonBinding = async (env = {}, threadMeta = {}, patch = {})
     console.warn('[wechat-ilink] persist daemon binding failed', error)
     return null
   }
+}
+
+const getWechatDaemonBindingByThreadMeta = async (env = {}, threadMeta = {}) => {
+  const normalizedThreadMeta = getThreadMetaFromInput(threadMeta)
+  if (!normalizedThreadMeta.threadKey) return null
+  const store = getWechatDaemonStoreSafe(env)
+  if (!store) return null
+  return store.getBindingByThreadKey(normalizedThreadMeta.threadKey).catch(() => null)
 }
 
 const appendWechatDaemonInboundUpdates = async (env = {}, threadMeta = {}, updates = [], options = {}) => {
@@ -127,9 +199,12 @@ const appendOutboxMessageToThreadContext = async (env = {}, threadMeta = {}, out
   return daemonStore.appendThreadContextMessages(normalizedThreadMeta.threadKey, [{
     id: normalizeText(outboxMessage?.clientMessageId || outboxMessage?.id || outboxMessage?.messageId),
     role,
-    type: 'text',
+    type: normalizeText(outboxMessage?.type) === 'image' ? 'image' : 'text',
     text: content,
     originalText: content,
+    url: normalizeText(outboxMessage?.mediaUrl),
+    mediaUrl: normalizeText(outboxMessage?.mediaUrl),
+    caption: normalizeText(outboxMessage?.caption),
     timestamp: Math.max(0, Number(outboxMessage?.createdAt || Date.now())),
     source: normalizeText(source || outboxMessage?.source)
   }], {
@@ -350,6 +425,7 @@ const mapIlinkUpdate = (update = {}) => {
     : []
   return {
     id: normalizeText(message.message_id || message.msg_id || message.msgid || message.id || update.id),
+    clientId: normalizeText(message.client_id || message.clientId || update.client_id || update.clientId),
     type: normalizeText(message.message_type || message.msg_type || message.msgtype || message.type || 'text'),
     content: normalizeText(textItems.join('\n') || message.content || message.text || message.message),
     from: normalizeText(message.from_user_id || sender.openid || sender.id || message.from_openid || message.from),
@@ -361,10 +437,50 @@ const mapIlinkUpdate = (update = {}) => {
 
 const normalizeIlinkUserId = (value = '') => normalizeText(value).toLowerCase()
 
+const normalizeRecentOutgoingClientIds = (items = [], now = Date.now()) => (
+  Array.isArray(items) ? items : []
+)
+  .map((item) => {
+    if (typeof item === 'string') {
+      return {
+        id: normalizeText(item),
+        sentAt: now
+      }
+    }
+    return {
+      id: normalizeText(item?.id || item?.clientId),
+      sentAt: Math.max(0, Number(item?.sentAt || item?.createdAt || 0))
+    }
+  })
+  .filter((item) => item.id)
+  .filter((item) => !item.sentAt || (now - item.sentAt) <= RECENT_OUTGOING_CLIENT_ID_TTL_MS)
+  .sort((left, right) => Number(right?.sentAt || 0) - Number(left?.sentAt || 0))
+  .slice(0, RECENT_OUTGOING_CLIENT_ID_LIMIT)
+
+const buildBindingStateWithOutgoingClientId = (state = {}, clientId = '', extra = {}) => {
+  const safeClientId = normalizeText(clientId)
+  const now = Date.now()
+  const recentClientIds = normalizeRecentOutgoingClientIds([
+    ...(Array.isArray(state?.recentOutgoingClientIds) ? state.recentOutgoingClientIds : []),
+    ...(safeClientId ? [{ id: safeClientId, sentAt: now }] : [])
+  ], now)
+  return {
+    ...state,
+    ...(extra && typeof extra === 'object' ? extra : {}),
+    recentOutgoingClientIds: recentClientIds,
+    createdAt: now,
+    updatedAt: now
+  }
+}
+
 const isSelfIlinkUpdate = (update = {}, state = {}) => {
   const updateFrom = normalizeIlinkUserId(update?.from)
   const botId = normalizeIlinkUserId(state?.botId)
-  return Boolean(updateFrom && botId && updateFrom === botId)
+  if (updateFrom && botId && updateFrom === botId) return true
+  const updateClientId = normalizeText(update?.clientId)
+  if (!updateClientId) return false
+  const recentClientIds = normalizeRecentOutgoingClientIds(state?.recentOutgoingClientIds)
+  return recentClientIds.some((item) => item.id === updateClientId)
 }
 
 const buildTextMessagePayload = (state = {}, input = {}) => {
@@ -621,34 +737,49 @@ const openBindingState = async (env = {}, bindingId = '') => {
   return state
 }
 
+const resolveWechatBindingAccess = async (env = {}, {
+  bindingId = '',
+  threadMeta = null,
+  message = null
+} = {}) => {
+  const inputThreadMeta = resolveThreadMeta({ threadMeta, message }, {})
+  const storedBinding = await getWechatDaemonBindingByThreadMeta(env, inputThreadMeta)
+  const storedBindingId = normalizeText(storedBinding?.bindingId || storedBinding?.remoteBindingId)
+  const requestBindingId = normalizeText(bindingId)
+  const preferredBindingId = storedBindingId || requestBindingId
+  if (!preferredBindingId) {
+    const error = new Error('missing_ilink_binding')
+    error.status = 401
+    throw error
+  }
+
+  try {
+    const state = await openBindingState(env, preferredBindingId)
+    return {
+      state,
+      bindingId: preferredBindingId,
+      threadMeta: resolveThreadMeta({ threadMeta, message }, state)
+    }
+  } catch (error) {
+    if (!requestBindingId || requestBindingId === preferredBindingId) throw error
+    const state = await openBindingState(env, requestBindingId)
+    return {
+      state,
+      bindingId: requestBindingId,
+      threadMeta: resolveThreadMeta({ threadMeta, message }, state)
+    }
+  }
+}
+
 export const syncWechatIlinkBinding = async ({
   env = {},
   bindingId = '',
   threadMeta = null
 } = {}) => {
-  const state = await openBindingState(env, bindingId)
-  const resolvedThreadMeta = resolveThreadMeta({ threadMeta }, state)
+  const bindingAccess = await resolveWechatBindingAccess(env, { bindingId, threadMeta })
+  const state = bindingAccess.state
+  const resolvedThreadMeta = bindingAccess.threadMeta
   const baseUrl = getIlinkBaseUrl(env, state)
-  // #region debug-point A:sync-now-start
-  fetch(REMOTE_DEBUG_EVENT_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      sessionId: 'wechat-sync-lag',
-      runId: 'pre-fix',
-      hypothesisId: 'H1',
-      location: 'server/wechatIlinkBridge.js:syncWechatIlinkBinding:start',
-      msg: '[DEBUG] sync-now started',
-      data: {
-        threadKey: resolvedThreadMeta.threadKey,
-        quietSeconds: Number(resolvedThreadMeta.quietSeconds || 0),
-        hasBindingId: !!normalizeText(bindingId),
-        hasSyncBuf: !!normalizeText(state.syncBuf)
-      },
-      ts: Date.now()
-    })
-  }).catch(() => {})
-  // #endregion
   const payload = await ilinkBusinessFetchJson(`${baseUrl}/ilink/bot/getupdates`, state, {
     get_updates_buf: normalizeText(state.syncBuf)
   }, env)
@@ -664,13 +795,11 @@ export const syncWechatIlinkBinding = async ({
   inboundUpdates.forEach((update) => {
     if (update.from && update.contextToken) contextByUser[update.from] = update.contextToken
   })
-  const nextBindingId = await sealState(env, {
-    ...state,
+  const nextBindingId = await sealState(env, buildBindingStateWithOutgoingClientId(state, '', {
     threadMeta: resolvedThreadMeta,
     syncBuf: normalizeText(payload.get_updates_buf || payload.syncbuf || payload.next_syncbuf || state.syncBuf),
-    contextByUser,
-    updatedAt: Date.now()
-  })
+    contextByUser
+  }))
   const latestInboundAt = inboundUpdates.reduce(
     (maxTs, update) => Math.max(maxTs, Number(update?.createdAt || 0)),
     0
@@ -684,59 +813,7 @@ export const syncWechatIlinkBinding = async ({
     lastInboundAt: latestInboundAt || 0,
     lastError: ''
   })
-  // #region debug-point F:sync-now-fetched
-  fetch(REMOTE_DEBUG_EVENT_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      sessionId: 'wechat-inbound-missing',
-      runId: 'pre-fix',
-      hypothesisId: 'H1',
-      location: 'server/wechatIlinkBridge.js:syncWechatIlinkBinding:fetched',
-      msg: '[DEBUG] server completed getupdates fetch',
-      data: {
-        threadKey: resolvedThreadMeta.threadKey,
-        updateCount: updates.length,
-        inboundUpdateCount: inboundUpdates.length,
-        selfEchoCount: selfEchoUpdates.length,
-        latestInboundAt,
-        hasNextSyncBuf: !!normalizeText(payload.get_updates_buf || payload.syncbuf || payload.next_syncbuf || state.syncBuf),
-        firstUpdateId: normalizeText(inboundUpdates[0]?.id || updates[0]?.id),
-        firstUpdateText: normalizeText(inboundUpdates[0]?.content || updates[0]?.content).slice(0, 80)
-      },
-      ts: Date.now()
-    })
-  }).catch(() => {})
-  // #endregion
   if (inboundUpdates.length) {
-    // #region debug-point A:ilink-updates-pulled
-    fetch(REMOTE_DEBUG_EVENT_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        sessionId: 'wechat-sync-lag',
-        runId: 'pre-fix',
-        hypothesisId: 'H1',
-        location: 'server/wechatIlinkBridge.js:syncWechatIlinkBinding:updates',
-        msg: '[DEBUG] ilink updates pulled',
-        data: {
-          threadKey: resolvedThreadMeta.threadKey,
-          updateCount: updates.length,
-          inboundUpdateCount: inboundUpdates.length,
-          selfEchoCount: selfEchoUpdates.length,
-          latestInboundAt,
-          quietSeconds: resolvedThreadMeta.quietSeconds,
-          firstUpdate: {
-            id: inboundUpdates[0]?.id || updates[0]?.id || '',
-            from: inboundUpdates[0]?.from || updates[0]?.from || '',
-            hasContextToken: !!(inboundUpdates[0]?.contextToken || updates[0]?.contextToken),
-            text: ((inboundUpdates[0]?.content || updates[0]?.content) || '').slice(0, 80)
-          }
-        },
-        ts: Date.now()
-      })
-    }).catch(() => {})
-    // #endregion
     await appendWechatDaemonInboundUpdates(env, resolvedThreadMeta, inboundUpdates, {
       status: 'bound',
       bindingId: nextBindingId,
@@ -752,12 +829,8 @@ export const syncWechatIlinkBinding = async ({
     : null
   return {
     updates: inboundUpdates,
-    recentInboundUpdates: Array.isArray(latestBinding?.recentInboundUpdates)
-      ? latestBinding.recentInboundUpdates
-      : [],
-    recentThreadMessages: Array.isArray(latestBinding?.threadContextSnapshot?.messages)
-      ? latestBinding.threadContextSnapshot.messages.slice(-40)
-      : [],
+    recentInboundUpdates: [],
+    recentThreadMessages: listRecentThreadContextMessages(latestBinding),
     bindingId: nextBindingId,
     remoteBindingId: nextBindingId,
     latestInboundAt
@@ -792,8 +865,10 @@ export const sendWechatIlinkTextMessage = async ({
   message = null,
   threadMeta = null
 } = {}) => {
-  const state = await openBindingState(env, bindingId)
-  const resolvedThreadMeta = resolveThreadMeta({ threadMeta, message }, state)
+  const bindingAccess = await resolveWechatBindingAccess(env, { bindingId, threadMeta, message })
+  const state = bindingAccess.state
+  const activeBindingId = bindingAccess.bindingId
+  const resolvedThreadMeta = bindingAccess.threadMeta
   const baseUrl = getIlinkBaseUrl(env, state)
   const payload = buildTextMessagePayload(state, message || {})
   if (!payload.msg.item_list[0]?.text_item?.text) {
@@ -807,10 +882,13 @@ export const sendWechatIlinkTextMessage = async ({
     throw error
   }
   const result = await ilinkBusinessFetchJson(`${baseUrl}/ilink/bot/sendmessage`, state, payload, env)
+  const nextBindingId = await sealState(env, buildBindingStateWithOutgoingClientId(state, payload.msg.client_id, {
+    threadMeta: resolvedThreadMeta
+  }))
   await persistWechatDaemonBinding(env, resolvedThreadMeta, {
     status: 'bound',
-    bindingId: normalizeText(bindingId),
-    remoteBindingId: normalizeText(bindingId),
+    bindingId: nextBindingId,
+    remoteBindingId: nextBindingId,
     lastSentAt: Date.now(),
     lastError: ''
   })
@@ -827,12 +905,14 @@ export const sendWechatIlinkMediaMessage = async ({
   message = null,
   threadMeta = null
 } = {}) => {
-  const state = await openBindingState(env, bindingId)
-  const resolvedThreadMeta = resolveThreadMeta({ threadMeta, message }, state)
-  const baseUrl = getIlinkBaseUrl(env, state)
+  let bindingAccess = await resolveWechatBindingAccess(env, { bindingId, threadMeta, message })
+  let state = bindingAccess.state
+  let activeBindingId = bindingAccess.bindingId
+  let resolvedThreadMeta = bindingAccess.threadMeta
+  let baseUrl = getIlinkBaseUrl(env, state)
   const safeMessage = message && typeof message === 'object' ? message : {}
   const to = normalizeText(safeMessage.to || safeMessage.openid)
-  const contextToken = normalizeText(safeMessage.contextToken || safeMessage.context_token)
+  let contextToken = normalizeText(safeMessage.contextToken || safeMessage.context_token)
     || normalizeText(state.contextByUser?.[to])
   const mediaUrl = normalizeText(safeMessage.mediaUrl || safeMessage.media_url)
   const caption = normalizeText(safeMessage.caption || safeMessage.content)
@@ -854,7 +934,7 @@ export const sendWechatIlinkMediaMessage = async ({
   if (caption) {
     await sendWechatIlinkTextMessage({
       env,
-      bindingId,
+      bindingId: activeBindingId,
       threadMeta: resolvedThreadMeta,
       message: {
         to,
@@ -862,6 +942,13 @@ export const sendWechatIlinkMediaMessage = async ({
         contextToken
       }
     })
+    bindingAccess = await resolveWechatBindingAccess(env, { bindingId: activeBindingId, threadMeta: resolvedThreadMeta, message })
+    state = bindingAccess.state
+    activeBindingId = bindingAccess.bindingId
+    resolvedThreadMeta = bindingAccess.threadMeta
+    baseUrl = getIlinkBaseUrl(env, state)
+    contextToken = normalizeText(safeMessage.contextToken || safeMessage.context_token)
+      || normalizeText(state.contextByUser?.[to])
   }
   const uploaded = await uploadWechatIlinkImageFromUrl({
     env,
@@ -876,10 +963,13 @@ export const sendWechatIlinkMediaMessage = async ({
     contextToken
   }, uploaded)
   const result = await ilinkBusinessFetchJson(`${baseUrl}/ilink/bot/sendmessage`, state, payload, env)
+  const nextBindingId = await sealState(env, buildBindingStateWithOutgoingClientId(state, payload.msg.client_id, {
+    threadMeta: resolvedThreadMeta
+  }))
   await persistWechatDaemonBinding(env, resolvedThreadMeta, {
     status: 'bound',
-    bindingId: normalizeText(bindingId),
-    remoteBindingId: normalizeText(bindingId),
+    bindingId: nextBindingId,
+    remoteBindingId: nextBindingId,
     lastSentAt: Date.now(),
     lastError: ''
   })
@@ -898,8 +988,10 @@ export const sendWechatIlinkTypingIndicator = async ({
   contextToken = '',
   status = 1
 } = {}) => {
-  const state = await openBindingState(env, bindingId)
-  const resolvedThreadMeta = resolveThreadMeta({ threadMeta }, state)
+  const bindingAccess = await resolveWechatBindingAccess(env, { bindingId, threadMeta })
+  const state = bindingAccess.state
+  const activeBindingId = bindingAccess.bindingId
+  const resolvedThreadMeta = bindingAccess.threadMeta
   const baseUrl = getIlinkBaseUrl(env, state)
   const ilinkUserId = normalizeText(to || resolvedThreadMeta.lastInboundFrom)
   if (!ilinkUserId) {
@@ -930,8 +1022,8 @@ export const sendWechatIlinkTypingIndicator = async ({
   }), env)
   await persistWechatDaemonBinding(env, resolvedThreadMeta, {
     status: 'bound',
-    bindingId: normalizeText(bindingId),
-    remoteBindingId: normalizeText(bindingId),
+    bindingId: activeBindingId,
+    remoteBindingId: activeBindingId,
     lastTypingAt: Date.now(),
     lastError: ''
   })
@@ -960,13 +1052,19 @@ const handleSend = async (req, res, env) => {
 const handleConfig = async (req, res, env) => {
   const body = getRequestBody(req)
   const threadMeta = getThreadMetaFromInput(body?.threadMeta)
+  const existingBinding = await getWechatDaemonBindingByThreadMeta(env, threadMeta)
+  const existingBindingId = normalizeText(existingBinding?.bindingId || existingBinding?.remoteBindingId)
+  const requestBindingId = normalizeText(body?.bindingId)
+  const nextBindingId = existingBindingId || requestBindingId
   const patch = body?.config && typeof body.config === 'object'
     ? {
         wechatReplyTriggersAi: body.config.wechatReplyTriggersAi,
         pwaChatToWechat: body.config.pwaChatToWechat,
         quietSeconds: body.config.quietSeconds,
-        bindingId: normalizeText(body?.bindingId),
-        remoteBindingId: normalizeText(body?.bindingId)
+        ...(nextBindingId ? {
+          bindingId: nextBindingId,
+          remoteBindingId: nextBindingId
+        } : {})
       }
     : {}
   const result = await persistWechatDaemonBinding(env, threadMeta, patch)
@@ -990,34 +1088,18 @@ const handleThreadContext = async (req, res, env) => {
     }, 400)
     return
   }
-  // #region debug-point A:thread-context-start
-  fetch(REMOTE_DEBUG_EVENT_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      sessionId: 'wechat-sync-lag',
-      runId: 'pre-fix',
-      hypothesisId: 'H4',
-      location: 'server/wechatIlinkBridge.js:handleThreadContext:start',
-      msg: '[DEBUG] thread-context received',
-      data: {
-        threadKey: threadMeta.threadKey,
-        updatedAt: Number(snapshot?.updatedAt || 0),
-        messageCount: Array.isArray(snapshot?.messages) ? snapshot.messages.length : 0,
-        hasBackgroundDeviceId: !!normalizeText(snapshot?.backgroundDeviceId || snapshot?.deviceId),
-        lastMessagePreview: Array.isArray(snapshot?.messages) && snapshot.messages.length
-          ? normalizeText(snapshot.messages[snapshot.messages.length - 1]?.text || snapshot.messages[snapshot.messages.length - 1]?.originalText).slice(0, 80)
-          : ''
-      },
-      ts: Date.now()
-    })
-  }).catch(() => {})
-  // #endregion
+  const existingBinding = await getWechatDaemonBindingByThreadMeta(env, threadMeta)
+  const existingBindingId = normalizeText(existingBinding?.bindingId || existingBinding?.remoteBindingId)
+  const requestBindingId = normalizeText(body?.bindingId)
+  const nextBindingId = existingBindingId || requestBindingId
+  const mergedSnapshot = mergeThreadContextSnapshots(existingBinding?.threadContextSnapshot, snapshot)
   const result = await persistWechatDaemonBinding(env, threadMeta, {
-    bindingId: normalizeText(body?.bindingId),
-    remoteBindingId: normalizeText(body?.bindingId),
-    threadContextSnapshot: snapshot,
-    threadContextUpdatedAt: Math.max(0, Number(snapshot?.updatedAt || Date.now()))
+    ...(nextBindingId ? {
+      bindingId: nextBindingId,
+      remoteBindingId: nextBindingId
+    } : {}),
+    threadContextSnapshot: mergedSnapshot,
+    threadContextUpdatedAt: Math.max(0, Number(mergedSnapshot?.updatedAt || Date.now()))
   })
   const daemonAiStatus = await probeWechatDaemonAiSettings(env, {
     binding: result,
@@ -1027,28 +1109,6 @@ const handleThreadContext = async (req, res, env) => {
     error: normalizeText(error?.message) || 'wechat_daemon_ai_probe_failed',
     userMessage: normalizeText(error?.message) || '后台 AI 配置检查失败'
   }))
-  // #region debug-point A:thread-context-result
-  fetch(REMOTE_DEBUG_EVENT_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      sessionId: 'wechat-sync-lag',
-      runId: 'pre-fix',
-      hypothesisId: 'H4',
-      location: 'server/wechatIlinkBridge.js:handleThreadContext:result',
-      msg: '[DEBUG] thread-context persisted',
-      data: {
-        threadKey: threadMeta.threadKey,
-        storedUpdatedAt: Number(result?.threadContextUpdatedAt || result?.threadContextSnapshot?.updatedAt || 0),
-        storedMessageCount: Array.isArray(result?.threadContextSnapshot?.messages) ? result.threadContextSnapshot.messages.length : 0,
-        daemonAiOk: daemonAiStatus?.ok === true,
-        daemonAiError: normalizeText(daemonAiStatus?.error),
-        daemonAiMessage: normalizeText(daemonAiStatus?.userMessage).slice(0, 120)
-      },
-      ts: Date.now()
-    })
-  }).catch(() => {})
-  // #endregion
   json(res, {
     ok: true,
     binding: result,
@@ -1067,9 +1127,6 @@ const handleOutboxEnqueue = async (req, res, env) => {
   )
   const messageType = normalizeText(body?.message?.type || body?.type || 'text') || 'text'
   const mediaUrl = normalizeText(body?.message?.mediaUrl || body?.message?.media_url || body?.mediaUrl || body?.media_url)
-  // #region debug-point C:outbox-enqueue-request
-  fetch('http://127.0.0.1:7777/event',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'wechat-daemon-sync',runId:'pre-fix',hypothesisId:'C',location:'server/wechatIlinkBridge.js:handleOutboxEnqueue',msg:'[DEBUG] outbox enqueue request received',data:{threadKey:threadMeta.threadKey||'',bindingId:normalizeText(body?.bindingId),source:normalizeText(body?.source),contentPreview:content.slice(0,80),hasTo:!!normalizeText(body?.message?.to||body?.to),hasContextToken:!!normalizeText(body?.message?.contextToken||body?.contextToken)},ts:Date.now()})}).catch(()=>{})
-  // #endregion
   if (!content && !(messageType === 'image' && mediaUrl)) {
     json(res, {
       ok: false,

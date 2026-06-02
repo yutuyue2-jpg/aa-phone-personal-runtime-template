@@ -1,14 +1,14 @@
+import {
+  getBackgroundAiKeyPayload,
+  getBackgroundSnapshot,
+  listBackgroundDeviceIds,
+} from '../backgroundRuntimeStore.js'
 import { normalizeWechatDaemonThreadMeta } from './wechatDaemonStore.js'
 
 const DEFAULT_MAIN_BASE_URL = 'https://api.openai.com/v1'
 const DEFAULT_MAIN_MODEL = 'gpt-3.5-turbo'
-const BACKGROUND_DEVICE_INDEX_KEY = 'devices:index'
-const BACKGROUND_SNAPSHOT_PREFIX = 'snapshot:'
-const BACKGROUND_KEY_PREFIX = 'background-ai:'
 
 const normalizeText = (value = '') => String(value || '').trim()
-const REMOTE_DEBUG_EVENT_URL = 'https://ai-phone-background.yutuyue2.workers.dev/debug/event'
-
 const clone = (value) => JSON.parse(JSON.stringify(value))
 
 const THREAD_CONTEXT_LOADER_KEYS = [
@@ -28,32 +28,6 @@ function safeId(value = '') {
   return normalizeText(value).replace(/[^\w:-]/g, '').slice(0, 160)
 }
 
-function resolveKvNamespace(env = process.env) {
-  const candidates = [
-    env.WECHAT_DAEMON_KV,
-    env.AI_PHONE_WECHAT_DAEMON_KV,
-    env.PROACTIVE_KV
-  ]
-  return candidates.find((item) => (
-    item
-    && typeof item.get === 'function'
-    && typeof item.put === 'function'
-  )) || null
-}
-
-async function getKvJson(env = process.env, key = '', fallback = null) {
-  const kv = resolveKvNamespace(env)
-  const safeKey = normalizeText(key)
-  if (!kv || !safeKey) return fallback
-  const raw = await kv.get(safeKey)
-  if (!raw) return fallback
-  try {
-    return JSON.parse(raw)
-  } catch {
-    return fallback
-  }
-}
-
 function base64UrlToUint8Array(value = '') {
   const text = normalizeText(value).replace(/-/g, '+').replace(/_/g, '/')
   const padded = `${text}${'='.repeat((4 - (text.length % 4)) % 4)}`
@@ -66,8 +40,8 @@ async function sha256Bytes(value = '') {
 }
 
 async function getAesKey(env = process.env) {
-  const secret = normalizeText(env.KEY_ENCRYPTION_SECRET || env.BACKGROUND_KEY_ENCRYPTION_SECRET)
-  if (!secret) throw new Error('missing_KEY_ENCRYPTION_SECRET')
+  const secret = normalizeText(env.PERSONAL_RUNTIME_DATA_SECRET)
+  if (!secret) throw new Error('missing_PERSONAL_RUNTIME_DATA_SECRET')
   const digest = await sha256Bytes(secret)
   return crypto.subtle.importKey('raw', digest, 'AES-GCM', false, ['decrypt'])
 }
@@ -114,14 +88,14 @@ async function resolveBackgroundDeviceId(env = process.env, {
   )
   if (explicitId) return explicitId
 
-  const deviceIds = await getKvJson(env, BACKGROUND_DEVICE_INDEX_KEY, [])
+  const deviceIds = await listBackgroundDeviceIds(env, 2000).catch(() => [])
   const safeDeviceIds = (Array.isArray(deviceIds) ? deviceIds : [])
     .map((item) => safeId(item))
     .filter(Boolean)
   if (safeDeviceIds.length === 1) return safeDeviceIds[0]
 
   for (const deviceId of safeDeviceIds.slice(-80).reverse()) {
-    const snapshot = await getKvJson(env, `${BACKGROUND_SNAPSHOT_PREFIX}${deviceId}`)
+    const snapshot = await getBackgroundSnapshot(env, deviceId).catch(() => null)
     if (snapshotMatchesWechatThread(snapshot, { binding, contact })) return deviceId
   }
   return ''
@@ -139,7 +113,7 @@ async function loadBackgroundAiSettings(env = process.env, {
       error: 'wechat_daemon_background_device_missing'
     }
   }
-  const encrypted = await getKvJson(env, `${BACKGROUND_KEY_PREFIX}${deviceId}`)
+  const encrypted = await getBackgroundAiKeyPayload(env, deviceId).catch(() => null)
   if (!encrypted) {
     return {
       ok: false,
@@ -153,7 +127,7 @@ async function loadBackgroundAiSettings(env = process.env, {
   } catch (error) {
     return {
       ok: false,
-      error: normalizeText(error?.message) === 'missing_KEY_ENCRYPTION_SECRET'
+      error: normalizeText(error?.message) === 'missing_PERSONAL_RUNTIME_DATA_SECRET'
         ? 'wechat_daemon_background_ai_secret_missing'
         : 'wechat_daemon_background_ai_decrypt_failed',
       backgroundDeviceId: deviceId
@@ -221,7 +195,7 @@ export function getWechatDaemonAiResolutionUserMessage(code = '') {
     return '后台设备已经识别到了，但这个设备下还没有保存后台 AI Key。请重新保存一次“后台消息专用 API Key”。'
   }
   if (raw === 'wechat_daemon_background_ai_secret_missing') {
-    return '后台解密密钥缺失，当前无法读取已保存的后台 AI Key。请检查部署环境里的 KEY_ENCRYPTION_SECRET。'
+    return '后台解密密钥缺失，当前无法读取已保存的后台 AI Key。请检查部署环境里的 PERSONAL_RUNTIME_DATA_SECRET。'
   }
   if (raw === 'wechat_daemon_background_ai_decrypt_failed') {
     return '后台 AI Key 解密失败。通常是更换过加密密钥后，旧 Key 还没重新保存。请重新保存一次“后台消息专用 API Key”。'
@@ -285,9 +259,13 @@ function buildOutboundWechatMessage(message = {}, index = 0, baseTimestamp = Dat
     translatedText,
     transcript,
     description,
+    url: normalizeText(safe.url || safe.mediaUrl),
+    mediaUrl: normalizeText(safe.mediaUrl || safe.url),
+    caption: normalizeText(safe.caption),
     timestamp,
     amount: normalizeText(safe.amount),
-    status: normalizeText(safe.status || 'queued')
+    status: normalizeText(safe.status || 'queued'),
+    source: normalizeText(safe.source || 'daemon_auto_reply')
   }
 }
 
@@ -567,7 +545,10 @@ function buildReplyThreadContextMessages(replyAction = null) {
   const replyMessages = Array.isArray(replyAction?.replyMessages) ? replyAction.replyMessages : []
   if (replyMessages.length) {
     return replyMessages
-      .map((message, index) => buildOutboundWechatMessage(message, index, baseTimestamp))
+      .map((message, index) => buildOutboundWechatMessage({
+        ...message,
+        source: normalizeText(message?.source || 'daemon_auto_reply')
+      }, index, baseTimestamp))
       .filter((message) => (
         message.id
         || message.originalText
@@ -579,7 +560,8 @@ function buildReplyThreadContextMessages(replyAction = null) {
   return extractRenderableReplyTexts(replyAction)
     .map((text, index) => buildOutboundWechatMessage({
       type: 'text',
-      originalText: text
+      originalText: text,
+      source: 'daemon_auto_reply'
     }, index, baseTimestamp))
 }
 
@@ -601,10 +583,6 @@ function normalizeChatCompletionEndpoint(baseUrl = '') {
 function buildDirectReplyMessages({ contact = null, mergedMessages = [], inboundUpdates = [] } = {}) {
   const roleName = normalizeText(contact?.remarkName || contact?.name) || '对方'
   const persona = normalizeText(contact?.persona || contact?.intro)
-  const latestInbound = [...inboundUpdates]
-    .map((item, index) => normalizeInboundUpdate(item, index))
-    .reverse()
-    .find((item) => item.content)
   const history = (Array.isArray(mergedMessages) ? mergedMessages : [])
     .slice(-18)
     .map((message) => ({
@@ -624,11 +602,7 @@ function buildDirectReplyMessages({ contact = null, mergedMessages = [], inbound
         '如果需要分成多条微信气泡，请每条气泡单独占一行，最多 3 行。'
       ].filter(Boolean).join('\n')
     },
-    ...history,
-    ...(latestInbound?.content ? [{
-      role: 'user',
-      content: latestInbound.content
-    }] : [])
+    ...history
   ]
 }
 
@@ -719,30 +693,6 @@ export function createWechatDaemonAutoReplyHandler(env = process.env) {
     })
     const baseMessages = Array.isArray(threadContext.messages) ? threadContext.messages : []
     const mergedMessages = mergeConversationMessages(baseMessages, normalizedInbound)
-    // #region debug-point C:auto-reply-context
-    fetch(REMOTE_DEBUG_EVENT_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        sessionId: 'wechat-sync-lag',
-        runId: 'pre-fix',
-        hypothesisId: 'H4',
-        location: 'server/wechatDaemonAutoReplyHandler.js:context',
-        msg: '[DEBUG] auto reply loaded thread context',
-        data: {
-          threadKey: safeBinding.threadKey,
-          inboundCount: normalizedInbound.length,
-          baseMessageCount: baseMessages.length,
-          mergedMessageCount: mergedMessages.length,
-          snapshotUpdatedAt: Number(threadContext?.updatedAt || safeBinding?.threadContextUpdatedAt || 0),
-          latestInboundId: normalizeText(normalizedInbound[normalizedInbound.length - 1]?.id),
-          latestInboundText: normalizeText(normalizedInbound[normalizedInbound.length - 1]?.content).slice(0, 80),
-          latestMergedText: normalizeText(mergedMessages[mergedMessages.length - 1]?.text || mergedMessages[mergedMessages.length - 1]?.originalText || mergedMessages[mergedMessages.length - 1]?.content).slice(0, 80)
-        },
-        ts: Date.now()
-      })
-    }).catch(() => {})
-    // #endregion
     const contact = buildRoleContact(safeBinding, threadContext, mergedMessages)
     const settingsStore = await hydrateAiSettingsFromBackgroundKey({
       env,
@@ -808,27 +758,6 @@ export function createWechatDaemonAutoReplyHandler(env = process.env) {
     if (!replyAction) {
       throw new Error('wechat_daemon_auto_reply_missing_renderable_reply')
     }
-    // #region debug-point C:auto-reply-result
-    fetch(REMOTE_DEBUG_EVENT_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        sessionId: 'wechat-sync-lag',
-        runId: 'pre-fix',
-        hypothesisId: 'H4',
-        location: 'server/wechatDaemonAutoReplyHandler.js:reply',
-        msg: '[DEBUG] auto reply generated reply action',
-        data: {
-          threadKey: safeBinding.threadKey,
-          replyText: extractRenderableReplyTexts(replyAction).join(' | ').slice(0, 160),
-          actionType: normalizeText(replyAction?.type),
-          hasPlan: !!plan
-        },
-        ts: Date.now()
-      })
-    }).catch(() => {})
-    // #endregion
-
     const outboxMessages = buildOutboxMessages({
       binding: safeBinding,
       inboundUpdates: normalizedInbound,

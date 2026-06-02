@@ -1,19 +1,20 @@
+import { appendPendingMessage } from '../backgroundRuntimeStore.js'
 import { getWechatDaemonStore } from './wechatDaemonStore.js'
 import { getWechatOutboxStore } from './wechatOutboxStore.js'
 import { sendWechatIlinkMediaMessage, sendWechatIlinkTextMessage, sendWechatIlinkTypingIndicator, syncWechatIlinkBinding } from './wechatIlinkBridge.js'
 
 const normalizeText = (value = '') => String(value || '').trim()
-const REMOTE_DEBUG_EVENT_URL = 'https://ai-phone-background.yutuyue2.workers.dev/debug/event'
 
 const DEFAULT_POLL_INTERVAL_MS = 3000
 const AUTO_REPLY_RETRY_DELAY_MS = 60 * 1000
 const DEFAULT_AUTO_REPLY_HANDLER_TIMEOUT_MS = 50 * 1000
 const DEFAULT_INLINE_QUIET_WAIT_MS = 12 * 1000
 const DEFAULT_OUTBOX_DELIVERY_GAP_MS = 900
+const DEFAULT_OUTBOX_SEND_LEASE_MS = 45 * 1000
 const DEFAULT_TYPING_KEEPALIVE_MS = 5000
 const WECHAT_CONTEXT_TOKEN_MAX_AGE_MS = 23 * 60 * 60 * 1000
-const BACKGROUND_PENDING_PREFIX = 'pending:'
 const PROACTIVE_PENDING_LIMIT = 20
+const INLINE_OUTBOX_GAP_WAIT_LIMIT_MS = 5000
 
 function resolvePollIntervalMs(env = process.env) {
   const parsed = Math.floor(Number(env.WECHAT_DAEMON_POLL_INTERVAL_MS || DEFAULT_POLL_INTERVAL_MS))
@@ -88,7 +89,7 @@ function buildVisibleAutoReplyError(error = null) {
     return '小手机微信同步出错：后台设备已经识别到了，但这个设备下还没有保存后台 AI Key。请重新保存一次“后台消息专用 API Key”。'
   }
   if (raw === 'wechat_daemon_background_ai_secret_missing') {
-    return '小手机微信同步出错：后台解密密钥缺失，当前无法读取已保存的后台 AI Key。请检查部署环境里的 `KEY_ENCRYPTION_SECRET`。'
+    return '小手机微信同步出错：后台解密密钥缺失，当前无法读取已保存的后台 AI Key。请检查部署环境里的 `PERSONAL_RUNTIME_DATA_SECRET`。'
   }
   if (raw === 'wechat_daemon_background_ai_decrypt_failed' || raw.includes('Decryption failed')) {
     return '小手机微信同步出错：后台 AI Key 解密失败。通常是更换过加密密钥后，旧 Key 还没重新保存。请重新保存一次“后台消息专用 API Key”。'
@@ -132,7 +133,10 @@ function buildLatestSentAtByThread(messages = []) {
 
 function listDueOutboxMessages(messages = [], limit = 20, now = Date.now()) {
   return (Array.isArray(messages) ? messages : [])
-    .filter((item) => normalizeText(item?.status) === 'pending' && Number(item?.nextAttemptAt || 0) <= now)
+    .filter((item) => (
+      ['pending', 'sending'].includes(normalizeText(item?.status))
+      && Number(item?.nextAttemptAt || 0) <= now
+    ))
     .sort((a, b) => Number(a?.createdAt || 0) - Number(b?.createdAt || 0))
     .slice(0, Math.max(1, Number(limit || 20)))
 }
@@ -144,23 +148,6 @@ function resolveTypingTarget(binding = {}) {
     to: normalizeText(latestInbound?.from || binding?.lastInboundFrom),
     contextToken: normalizeText(latestInbound?.contextToken || binding?.lastInboundContextToken)
   }
-}
-
-async function getKvJson(env = process.env, key = '', fallback = null) {
-  if (!env?.PROACTIVE_KV || typeof env.PROACTIVE_KV.get !== 'function') return fallback
-  const raw = await env.PROACTIVE_KV.get(key)
-  if (!raw) return fallback
-  try {
-    return JSON.parse(raw)
-  } catch {
-    return fallback
-  }
-}
-
-async function putKvJson(env = process.env, key = '', value = null) {
-  if (!env?.PROACTIVE_KV || typeof env.PROACTIVE_KV.put !== 'function') return false
-  await env.PROACTIVE_KV.put(key, JSON.stringify(value))
-  return true
 }
 
 export function createWechatDaemonRuntime(env = process.env) {
@@ -203,28 +190,22 @@ export function createWechatDaemonRuntime(env = process.env) {
       : {}
     const roleId = normalizeText(contact.id || safeBinding.roleId)
     if (deviceId && roleId) {
-      const pendingKey = `${BACKGROUND_PENDING_PREFIX}${deviceId}`
-      const currentPending = await getKvJson(env, pendingKey, [])
-      const nextPending = [
-        ...(Array.isArray(currentPending) ? currentPending : []),
-        {
-          messageId: `wechat_daemon_error_${Date.now()}`,
+      await appendPendingMessage(env, deviceId, {
+        messageId: `wechat_daemon_error_${Date.now()}`,
+        roleId,
+        roleName: normalizeText(contact.remarkName || contact.name || safeBinding.externalAccountName || '微信同步'),
+        title: '微信同步出错',
+        body: errorText,
+        icon: normalizeText(contact.avatar || contact.avatarUrl),
+        rawText: errorText,
+        createdAt: Date.now(),
+        data: {
+          action: 'open_chat',
           roleId,
-          roleName: normalizeText(contact.remarkName || contact.name || safeBinding.externalAccountName || '微信同步'),
-          title: '微信同步出错',
-          body: errorText,
-          icon: normalizeText(contact.avatar || contact.avatarUrl),
-          rawText: errorText,
-          createdAt: Date.now(),
-          data: {
-            action: 'open_chat',
-            roleId,
-            source: 'wechat_daemon_error',
-            threadKey
-          }
+          source: 'wechat_daemon_error',
+          threadKey
         }
-      ].slice(-PROACTIVE_PENDING_LIMIT)
-      await putKvJson(env, pendingKey, nextPending).catch(() => null)
+      }, PROACTIVE_PENDING_LIMIT).catch(() => null)
     }
     await outboxStore.enqueueMessage({
       threadMeta: safeBinding,
@@ -254,9 +235,6 @@ export function createWechatDaemonRuntime(env = process.env) {
         })
         return async () => {}
       })
-      // #region debug-point B:runtime-handler-start
-      fetch('http://127.0.0.1:7777/event',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'wechat-daemon-sync',runId:'pre-fix',hypothesisId:'B',location:'server/wechatDaemonRuntime.js:processReadyAutoReplyThread',msg:'[DEBUG] daemon runtime invoking auto reply handler',data:{threadKey:claimedBinding.threadKey,processingInboundCount:Number(claimedBinding.processingInboundCount||0),snapshotUpdatedAt:Number(claimedBinding.threadContextUpdatedAt||0),hasSnapshot:!!claimedBinding.threadContextSnapshot},ts:Date.now()})}).catch(()=>{})
-      // #endregion
       const result = await withTimeout(autoReplyHandler({
         env,
         binding: claimedBinding,
@@ -272,18 +250,12 @@ export function createWechatDaemonRuntime(env = process.env) {
       if (!queued) {
         throw new Error('wechat_daemon_auto_reply_not_queued')
       }
-      // #region debug-point B:runtime-handler-success
-      fetch('http://127.0.0.1:7777/event',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'wechat-daemon-sync',runId:'pre-fix',hypothesisId:'B',location:'server/wechatDaemonRuntime.js:processReadyAutoReplyThread',msg:'[DEBUG] daemon runtime handler queued outbox',data:{threadKey:claimedBinding.threadKey,outboxCount:Array.isArray(result?.outboxMessages)?result.outboxMessages.length:0,actionCount:Array.isArray(result?.actions)?result.actions.length:0},ts:Date.now()})}).catch(()=>{})
-      // #endregion
       await store.completeAutoReplyThread(binding.threadKey, {
         lastAutoReplyQueuedAt: Date.now(),
         lastError: ''
       })
       return true
     } catch (error) {
-      // #region debug-point B:runtime-handler-failed
-      fetch('http://127.0.0.1:7777/event',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'wechat-daemon-sync',runId:'pre-fix',hypothesisId:'B',location:'server/wechatDaemonRuntime.js:processReadyAutoReplyThread',msg:'[DEBUG] daemon runtime handler failed',data:{threadKey:claimedBinding?.threadKey||binding?.threadKey||'',error:normalizeText(error?.message||error)},ts:Date.now()})}).catch(()=>{})
-      // #endregion
       await store.failAutoReplyThread(binding.threadKey, {
         lastError: normalizeText(error?.message || error),
         autoReplyLastError: normalizeText(error?.message || error),
@@ -333,28 +305,34 @@ export function createWechatDaemonRuntime(env = process.env) {
     }
   }
 
+  const sendOutboxTypingStatus = async (binding = null, status = 1) => {
+    const safeBinding = binding && typeof binding === 'object' ? binding : {}
+    const bindingId = normalizeText(safeBinding.bindingId || safeBinding.remoteBindingId)
+    if (!bindingId) return null
+    const target = resolveTypingTarget(safeBinding)
+    if (!target.to) return null
+    return sendWechatIlinkTypingIndicator({
+      env,
+      bindingId,
+      threadMeta: safeBinding,
+      to: target.to,
+      contextToken: target.contextToken,
+      status
+    }).catch((error) => {
+      console.warn('[wechat-daemon] send outbox typing failed', {
+        threadKey: safeBinding.threadKey,
+        status,
+        error
+      })
+      return null
+    })
+  }
+
   const tick = async () => {
     if (state.tickInFlight) return
     state.tickInFlight = true
     state.lastTickAt = Date.now()
     try {
-      // #region debug-point B:tick-start
-      fetch(REMOTE_DEBUG_EVENT_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sessionId: 'wechat-sync-lag',
-          runId: 'pre-fix',
-          hypothesisId: 'H5',
-          location: 'server/wechatDaemonRuntime.js:tick:start',
-          msg: '[DEBUG] daemon tick started',
-          data: {
-            lastTickAt: Number(state.lastTickAt || 0)
-          },
-          ts: Date.now()
-        })
-      }).catch(() => {})
-      // #endregion
       const bindings = await store.listBindings()
       let syncedThreadCount = 0
       let updateCount = 0
@@ -465,54 +443,45 @@ export function createWechatDaemonRuntime(env = process.env) {
           }
         }
       }
-      // #region debug-point B:tick-ready-summary
-      fetch(REMOTE_DEBUG_EVENT_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sessionId: 'wechat-sync-lag',
-          runId: 'pre-fix',
-          hypothesisId: 'H5',
-          location: 'server/wechatDaemonRuntime.js:tick:ready-summary',
-          msg: '[DEBUG] daemon tick ready summary',
-          data: {
-            syncedThreadCount,
-            updateCount,
-            recoveredAutoReplyCount,
-            readyAutoReplyCount,
-            processedAutoReplyCount,
-            readyThreadKeys: readyBindings.map((item) => normalizeText(item?.threadKey)).filter(Boolean).slice(0, 8)
-          },
-          ts: Date.now()
-        })
-      }).catch(() => {})
-      // #endregion
       const latestBindings = await store.listBindings()
       const allOutboxMessages = await outboxStore.listMessages()
       const latestSentAtByThread = buildLatestSentAtByThread(allOutboxMessages)
       const pendingMessages = listDueOutboxMessages(allOutboxMessages, 20, Date.now())
-      for (const message of pendingMessages) {
-        const binding = latestBindings.find((item) => item.threadKey === message.threadKey)
-        const bindingId = normalizeText(message.bindingId || message.remoteBindingId || binding?.bindingId || binding?.remoteBindingId)
+      for (const pendingMessage of pendingMessages) {
+        let claimedMessage = pendingMessage
+        const binding = latestBindings.find((item) => item.threadKey === pendingMessage.threadKey)
+        const bindingId = normalizeText(binding?.bindingId || binding?.remoteBindingId || pendingMessage.bindingId || pendingMessage.remoteBindingId)
         if (!bindingId) {
-          await outboxStore.patchMessage(message.id, {
+          await outboxStore.patchMessage(pendingMessage.id, {
             status: 'failed',
             lastError: 'missing_binding_id',
-            attemptCount: Number(message.attemptCount || 0) + 1,
+            attemptCount: Number(pendingMessage.attemptCount || 0) + 1,
             nextAttemptAt: Date.now() + 60 * 1000
           })
           continue
         }
         try {
-          const threadKey = normalizeText(message.threadKey || binding?.threadKey)
+          const threadKey = normalizeText(pendingMessage.threadKey || binding?.threadKey)
           const lastSentAt = Number(latestSentAtByThread.get(threadKey) || 0)
           const nextAllowedAt = lastSentAt + state.outboxDeliveryGapMs
           if (threadKey && state.outboxDeliveryGapMs > 0 && lastSentAt > 0 && nextAllowedAt > Date.now()) {
-            await outboxStore.patchMessage(message.id, {
-              nextAttemptAt: nextAllowedAt
-            })
-            continue
+            const waitMs = nextAllowedAt - Date.now()
+            if (waitMs > INLINE_OUTBOX_GAP_WAIT_LIMIT_MS) {
+              await outboxStore.patchMessage(pendingMessage.id, {
+                status: 'pending',
+                nextAttemptAt: nextAllowedAt
+              })
+              continue
+            }
+            await sendOutboxTypingStatus(binding, 1)
+            await sleep(waitMs)
           }
+          const message = await outboxStore.claimMessage(pendingMessage.id, {
+            now: Date.now(),
+            leaseMs: DEFAULT_OUTBOX_SEND_LEASE_MS
+          })
+          if (!message?.id) continue
+          claimedMessage = message
           const targetTo = normalizeText(message.to || binding?.lastInboundFrom)
           const contextToken = normalizeText(message.contextToken || binding?.lastInboundContextToken)
           if (!contextToken) {
@@ -522,9 +491,6 @@ export function createWechatDaemonRuntime(env = process.env) {
           if (lastInboundAt > 0 && Date.now() - lastInboundAt > WECHAT_CONTEXT_TOKEN_MAX_AGE_MS) {
             throw new Error('wechat_context_token_expired')
           }
-          // #region debug-point D:runtime-outbox-send-attempt
-          fetch('http://127.0.0.1:7777/event',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'wechat-daemon-sync',runId:'pre-fix',hypothesisId:'D',location:'server/wechatDaemonRuntime.js:tick',msg:'[DEBUG] daemon runtime sending outbox message',data:{messageId:message.id,threadKey:message.threadKey||binding?.threadKey||'',bindingId,hasTo:!!targetTo,hasContextToken:!!contextToken,contentPreview:normalizeText(message.content).slice(0,80),source:normalizeText(message.source)},ts:Date.now()})}).catch(()=>{})
-          // #endregion
           const sendResult = normalizeText(message.type) === 'image'
             ? await sendWechatIlinkMediaMessage({
               env,
@@ -550,9 +516,6 @@ export function createWechatDaemonRuntime(env = process.env) {
                 contextToken
               }
             })
-          // #region debug-point D:runtime-outbox-send-success
-          fetch('http://127.0.0.1:7777/event',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'wechat-daemon-sync',runId:'pre-fix',hypothesisId:'D',location:'server/wechatDaemonRuntime.js:tick',msg:'[DEBUG] daemon runtime sent outbox message',data:{messageId:message.id,threadKey:message.threadKey||binding?.threadKey||'',externalMessageId:normalizeText(sendResult?.messageId)},ts:Date.now()})}).catch(()=>{})
-          // #endregion
           const sentAt = Date.now()
           await outboxStore.patchMessage(message.id, {
             status: 'sent',
@@ -561,13 +524,11 @@ export function createWechatDaemonRuntime(env = process.env) {
             lastError: '',
             attemptCount: Number(message.attemptCount || 0) + 1
           })
+          await sendOutboxTypingStatus(binding, 2)
           if (threadKey) latestSentAtByThread.set(threadKey, sentAt)
         } catch (error) {
-          // #region debug-point D:runtime-outbox-send-failed
-          fetch('http://127.0.0.1:7777/event',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'wechat-daemon-sync',runId:'pre-fix',hypothesisId:'D',location:'server/wechatDaemonRuntime.js:tick',msg:'[DEBUG] daemon runtime failed to send outbox message',data:{messageId:message.id,threadKey:message.threadKey||binding?.threadKey||'',error:normalizeText(error?.message||error)},ts:Date.now()})}).catch(()=>{})
-          // #endregion
-          const nextAttemptCount = Number(message.attemptCount || 0) + 1
-          await outboxStore.patchMessage(message.id, {
+          const nextAttemptCount = Number(claimedMessage.attemptCount || 0) + 1
+          await outboxStore.patchMessage(claimedMessage.id, {
             status: nextAttemptCount >= 5 ? 'failed' : 'pending',
             lastError: normalizeText(error?.message || error),
             attemptCount: nextAttemptCount,
@@ -580,27 +541,6 @@ export function createWechatDaemonRuntime(env = process.env) {
       state.lastReadyAutoReplyCount = readyAutoReplyCount
       state.lastProcessedAutoReplyCount = processedAutoReplyCount
       state.lastError = ''
-      // #region debug-point B:tick-finished
-      fetch(REMOTE_DEBUG_EVENT_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sessionId: 'wechat-sync-lag',
-          runId: 'pre-fix',
-          hypothesisId: 'H5',
-          location: 'server/wechatDaemonRuntime.js:tick:finished',
-          msg: '[DEBUG] daemon tick finished',
-          data: {
-            lastSyncedThreadCount: syncedThreadCount,
-            lastUpdateCount: updateCount,
-            lastReadyAutoReplyCount: readyAutoReplyCount,
-            lastProcessedAutoReplyCount: processedAutoReplyCount,
-            pendingOutboxCount: (await outboxStore.listPendingMessages(200, Date.now())).length
-          },
-          ts: Date.now()
-        })
-      }).catch(() => {})
-      // #endregion
     } catch (error) {
       state.lastError = normalizeText(error?.message || error)
       console.warn('[wechat-daemon] tick failed', error)
@@ -652,11 +592,33 @@ export function createWechatDaemonRuntime(env = process.env) {
     }
   }
 
+  const getPublicStatus = async () => {
+    const status = await getStatus()
+    return {
+      ok: true,
+      service: status.service,
+      enabled: status.enabled,
+      started: status.started,
+      pollIntervalMs: status.pollIntervalMs,
+      outboxDeliveryGapMs: status.outboxDeliveryGapMs,
+      lastTickAt: status.lastTickAt,
+      lastSyncedThreadCount: status.lastSyncedThreadCount,
+      lastUpdateCount: status.lastUpdateCount,
+      lastReadyAutoReplyCount: status.lastReadyAutoReplyCount,
+      lastProcessedAutoReplyCount: status.lastProcessedAutoReplyCount,
+      autoReplyHandlerEnabled: status.autoReplyHandlerEnabled,
+      lastError: status.lastError,
+      threadCount: status.threadCount,
+      pendingOutboxCount: status.pendingOutboxCount
+    }
+  }
+
   return {
     start,
     stop,
     tick,
     getStatus,
+    getPublicStatus,
     store,
     outboxStore
   }
