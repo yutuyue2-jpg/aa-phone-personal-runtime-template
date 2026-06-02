@@ -221,6 +221,20 @@ function normalizeInboundUpdate(update = {}, index = 0) {
   }
 }
 
+function buildDaemonDebugState(overrides = {}) {
+  const safe = overrides && typeof overrides === 'object' ? overrides : {}
+  return {
+    updatedAt: Date.now(),
+    autoBrainConfigured: safe.autoBrainConfigured === true,
+    autoBrainAttempted: safe.autoBrainAttempted === true,
+    autoBrainSucceeded: safe.autoBrainSucceeded === true,
+    fallbackUsed: safe.fallbackUsed === true,
+    route: normalizeText(safe.route),
+    error: normalizeText(safe.error),
+    fallbackReason: normalizeText(safe.fallbackReason)
+  }
+}
+
 function buildMessageKey(message = {}) {
   return [
     normalizeText(message?.id),
@@ -283,6 +297,28 @@ function mergeConversationMessages(baseMessages = [], inboundUpdates = []) {
       nextMessages.push(message)
     })
   return nextMessages.sort((left, right) => Number(left?.timestamp || 0) - Number(right?.timestamp || 0))
+}
+
+function focusConversationMessages(mergedMessages = [], inboundUpdates = [], historyBeforeLatestInbound = 5, limit = 12) {
+  const safeMessages = Array.isArray(mergedMessages) ? mergedMessages.map((item) => clone(item)) : []
+  if (!safeMessages.length) return []
+  const normalizedInbound = Array.isArray(inboundUpdates)
+    ? inboundUpdates.map((item, index) => normalizeInboundUpdate(item, index))
+    : []
+  const latestInbound = [...normalizedInbound].reverse().find((item) => item.id || item.content) || null
+  if (!latestInbound) return safeMessages.slice(-Math.max(1, Number(limit || 12)))
+  const latestInboundMessage = buildInboundWechatMessage(latestInbound, 0)
+  const latestInboundKey = buildMessageKey(latestInboundMessage)
+  let latestInboundIndex = -1
+  for (let index = safeMessages.length - 1; index >= 0; index -= 1) {
+    if (buildMessageKey(safeMessages[index]) === latestInboundKey) {
+      latestInboundIndex = index
+      break
+    }
+  }
+  if (latestInboundIndex < 0) return safeMessages.slice(-Math.max(1, Number(limit || 12)))
+  const startIndex = Math.max(0, latestInboundIndex - Math.max(0, Number(historyBeforeLatestInbound || 5)))
+  return safeMessages.slice(startIndex, latestInboundIndex + 1).slice(-Math.max(1, Number(limit || 12)))
 }
 
 function resolveThreadContextLoader(env = process.env) {
@@ -493,11 +529,58 @@ function isDirectiveOnlyLine(text = '') {
   return /^\[[^\]]+\]$/.test(value) || /^【[^】]+】$/.test(value)
 }
 
+function extractStickerTokenFromDirective(text = '') {
+  const value = normalizeText(text)
+  const match = value.match(/^[\[【]\s*(?:表情|sticker)\s*[:：]\s*([^\]】]+?)\s*[\]】]$/i)
+  return normalizeText(match?.[1] || '')
+}
+
+function isWechatMediaUrl(value = '') {
+  const text = normalizeText(value)
+  return /^https?:\/\//i.test(text)
+}
+
+function resolveCustomStickerMediaUrl(customStickers = [], token = '') {
+  const safeToken = normalizeText(token).toLowerCase()
+  if (!safeToken) return ''
+  const stickers = Array.isArray(customStickers) ? customStickers : []
+  const matched = stickers.find((item) => {
+    const names = [
+      item?.token,
+      item?.name,
+      item?.title,
+      item?.label,
+      item?.id,
+      item?.desc,
+      item?.description,
+      item?.category
+    ].map((value) => normalizeText(value).toLowerCase()).filter(Boolean)
+    return names.includes(safeToken)
+  })
+  const mediaUrl = normalizeText(
+    matched?.mediaUrl
+    || matched?.imageUrl
+    || matched?.url
+    || matched?.src
+    || matched?.previewUrl
+  )
+  return isWechatMediaUrl(mediaUrl) ? mediaUrl : ''
+}
+
 function normalizeRenderableReplyText(text = '') {
   return normalizeText(text)
     .replace(/^\s*\[(?:语音|voice)\]\s*/i, '')
     .replace(/^\s*\[(?:assistant|ai|助手|角色)\]\s*[:：]\s*/i, '')
     .trim()
+}
+
+function extractReplyLines(replyAction = null) {
+  if (!replyAction || typeof replyAction !== 'object') return []
+  return String(replyAction.replyText || replyAction.text || '')
+    .replace(/\r/g, '')
+    .split('\n')
+    .map((line) => normalizeRenderableReplyText(line))
+    .filter(Boolean)
 }
 
 function extractRenderableReplyTexts(replyAction = null) {
@@ -507,29 +590,25 @@ function extractRenderableReplyTexts(replyAction = null) {
     .map((message) => normalizeRenderableReplyText(message?.originalText || message?.translatedText || message?.text))
     .filter((item) => item && !isDirectiveOnlyLine(item))
   if (textsFromMessages.length) return textsFromMessages
-  return String(replyAction.replyText || replyAction.text || '')
-    .replace(/\r/g, '')
-    .split('\n')
-    .map((line) => normalizeRenderableReplyText(line))
+  return extractReplyLines(replyAction)
     .filter((line) => line && !isDirectiveOnlyLine(line))
 }
 
 function buildOutboxMessages({
   binding = null,
   inboundUpdates = [],
-  replyAction = null
+  replyAction = null,
+  customStickers = []
 } = {}) {
   const safeBinding = binding && typeof binding === 'object' ? binding : {}
-  const texts = extractRenderableReplyTexts(replyAction)
   const latestInbound = [...inboundUpdates]
     .map((item, index) => normalizeInboundUpdate(item, index))
     .reverse()
     .find((item) => item.from || item.contextToken)
-  return texts.map((content, index) => ({
+  const buildBaseEnvelope = (index = 0) => ({
     threadMeta: normalizeWechatDaemonThreadMeta(safeBinding),
     to: normalizeText(latestInbound?.from || safeBinding.lastInboundFrom),
     contextToken: normalizeText(latestInbound?.contextToken || safeBinding.lastInboundContextToken),
-    content,
     source: 'daemon_auto_reply',
     idempotencyKey: [
       'wechat_daemon_auto_reply',
@@ -537,10 +616,62 @@ function buildOutboxMessages({
       normalizeText(latestInbound?.id || latestInbound?.createdAt || Date.now()),
       index
     ].filter(Boolean).join(':')
-  }))
+  })
+  const replyMessages = Array.isArray(replyAction?.replyMessages) ? replyAction.replyMessages : []
+  const messagesFromReplyPayload = replyMessages
+    .map((message, index) => {
+      const type = normalizeText(message?.type || 'text')
+      const mediaUrl = normalizeText(message?.mediaUrl || message?.url)
+      const content = normalizeText(
+        message?.originalText
+        || message?.text
+        || message?.translatedText
+        || message?.transcript
+        || message?.description
+      )
+      if ((type === 'image' || type === 'sticker') && mediaUrl) {
+        return {
+          ...buildBaseEnvelope(index),
+          type: 'image',
+          content: content || '[图片]',
+          caption: normalizeText(message?.caption || message?.description || message?.text),
+          mediaUrl
+        }
+      }
+      if (!content) return null
+      return {
+        ...buildBaseEnvelope(index),
+        type: 'text',
+        content
+      }
+    })
+    .filter(Boolean)
+  if (messagesFromReplyPayload.length) return messagesFromReplyPayload
+  return extractReplyLines(replyAction)
+    .map((content, index) => {
+      const stickerToken = extractStickerTokenFromDirective(content)
+      if (stickerToken) {
+        const mediaUrl = resolveCustomStickerMediaUrl(customStickers, stickerToken)
+        if (!mediaUrl) return null
+        return {
+          ...buildBaseEnvelope(index),
+          type: 'image',
+          content: `[表情:${stickerToken}]`,
+          caption: stickerToken,
+          mediaUrl
+        }
+      }
+      if (isDirectiveOnlyLine(content)) return null
+      return {
+        ...buildBaseEnvelope(index),
+        type: 'text',
+        content
+      }
+    })
+    .filter(Boolean)
 }
 
-function buildReplyThreadContextMessages(replyAction = null) {
+function buildReplyThreadContextMessages(replyAction = null, customStickers = []) {
   const baseTimestamp = Date.now()
   const replyMessages = Array.isArray(replyAction?.replyMessages) ? replyAction.replyMessages : []
   if (replyMessages.length) {
@@ -557,19 +688,41 @@ function buildReplyThreadContextMessages(replyAction = null) {
         || message.description
       ))
   }
-  return extractRenderableReplyTexts(replyAction)
-    .map((text, index) => buildOutboundWechatMessage({
-      type: 'text',
-      originalText: text,
-      source: 'daemon_auto_reply'
-    }, index, baseTimestamp))
+  return extractReplyLines(replyAction)
+    .map((text, index) => {
+      const stickerToken = extractStickerTokenFromDirective(text)
+      if (stickerToken) {
+        const mediaUrl = resolveCustomStickerMediaUrl(customStickers, stickerToken)
+        if (!mediaUrl) return null
+        return buildOutboundWechatMessage({
+          type: 'image',
+          originalText: `[表情:${stickerToken}]`,
+          caption: stickerToken,
+          mediaUrl,
+          url: mediaUrl,
+          source: 'daemon_auto_reply'
+        }, index, baseTimestamp)
+      }
+      if (isDirectiveOnlyLine(text)) return null
+      return buildOutboundWechatMessage({
+        type: 'text',
+        originalText: text,
+        source: 'daemon_auto_reply'
+      }, index, baseTimestamp)
+    })
+    .filter(Boolean)
 }
 
 function findReplyAction(plan = null) {
   const actions = Array.isArray(plan?.actions) ? plan.actions : []
   return actions.find((action) => {
     if (normalizeText(action?.type) !== 'wechat_reply') return false
-    return extractRenderableReplyTexts(action).length > 0
+    const replyMessages = Array.isArray(action?.replyMessages) ? action.replyMessages : []
+    if (replyMessages.some((message) => (
+      normalizeText(message?.mediaUrl || message?.url)
+      || normalizeText(message?.originalText || message?.translatedText || message?.text)
+    ))) return true
+    return extractReplyLines(action).length > 0
   }) || null
 }
 
@@ -580,11 +733,99 @@ function normalizeChatCompletionEndpoint(baseUrl = '') {
   return `${clean}/v1/chat/completions`
 }
 
-function buildDirectReplyMessages({ contact = null, mergedMessages = [], inboundUpdates = [] } = {}) {
+function formatDirectContextBlock(threadContext = null, contact = null) {
+  const safeThreadContext = threadContext && typeof threadContext === 'object'
+    ? threadContext
+    : {}
+  const safeContact = contact && typeof contact === 'object' ? contact : {}
+  const memory = safeContact.memory && typeof safeContact.memory === 'object'
+    ? safeContact.memory
+    : {}
+  const memoryText = normalizeText(
+    memory.summary
+    || memory.memorySummary
+    || memory.longTermMemory
+    || memory.profile
+    || ''
+  )
+  const recentEventCount = Math.max(0, Number(safeContact.contextEventCount || 0)) || 12
+  const recentEvents = Array.isArray(safeContact.recentEvents)
+    ? safeContact.recentEvents.slice(-recentEventCount)
+    : []
+  const worldBookEntries = Array.isArray(safeThreadContext.worldBookEntries)
+    ? safeThreadContext.worldBookEntries.slice(0, 24)
+    : []
+  const scheduleContext = safeThreadContext.scheduleContext && typeof safeThreadContext.scheduleContext === 'object'
+    ? safeThreadContext.scheduleContext
+    : null
+  const replyStrategyContext = safeThreadContext.replyStrategyContext && typeof safeThreadContext.replyStrategyContext === 'object'
+    ? safeThreadContext.replyStrategyContext
+    : null
+  const lines = []
+  if (memoryText) lines.push(`角色动态记忆：${memoryText}`)
+  if (recentEvents.length) {
+    lines.push('近期上下文事件：')
+    recentEvents.forEach((event) => {
+      const text = normalizeText(event?.text || event?.commentText || event?.privateMessageText)
+      if (text) lines.push(`- ${text}`)
+    })
+  }
+  if (worldBookEntries.length) {
+    lines.push('世界书/长期设定：')
+    worldBookEntries.forEach((entry) => {
+      const title = normalizeText(entry?.title)
+      const content = normalizeText(entry?.content)
+      if (content) lines.push(`- ${title ? `${title}：` : ''}${content}`)
+    })
+  }
+  if (scheduleContext) {
+    const scheduleLines = []
+    if (scheduleContext.currentStatusText || scheduleContext.currentStatus) {
+      scheduleLines.push(`当前状态：${scheduleContext.currentStatusText || scheduleContext.currentStatus}`)
+    }
+    if (scheduleContext.displayStatus) scheduleLines.push(`展示状态：${scheduleContext.displayStatus}`)
+    if (scheduleContext.replyDelayMode) scheduleLines.push(`回复模式：${scheduleContext.replyDelayMode}`)
+    if (scheduleContext.currentBlock?.title) {
+      scheduleLines.push(`当前时间段：${scheduleContext.currentBlock.title}`)
+    }
+    if (scheduleLines.length) lines.push(scheduleLines.join('\n'))
+  }
+  if (replyStrategyContext) {
+    const strategyLines = []
+    if (replyStrategyContext.strategy) strategyLines.push(`本轮策略：${replyStrategyContext.strategy}`)
+    if (replyStrategyContext.moodHint) strategyLines.push(`情绪提示：${replyStrategyContext.moodHint}`)
+    if (replyStrategyContext.dayTone) strategyLines.push(`dayTone：${replyStrategyContext.dayTone}`)
+    if (replyStrategyContext.displayStatus) strategyLines.push(`展示状态：${replyStrategyContext.displayStatus}`)
+    if (strategyLines.length) lines.push(strategyLines.join('\n'))
+  }
+  return lines.filter(Boolean).join('\n\n')
+}
+
+function buildDirectReplyMessages({
+  contact = null,
+  mergedMessages = [],
+  inboundUpdates = [],
+  customStickers = [],
+  threadContext = null
+} = {}) {
   const roleName = normalizeText(contact?.remarkName || contact?.name) || '对方'
   const persona = normalizeText(contact?.persona || contact?.intro)
+  const contextMessageCount = Math.max(1, Number(contact?.contextMessageCount || 0)) || 40
+  const contextBlock = formatDirectContextBlock(threadContext, contact)
+  const stickerList = (Array.isArray(customStickers) ? customStickers : [])
+    .map((item) => ({
+      name: normalizeText(item?.name),
+      desc: normalizeText(item?.desc)
+    }))
+    .filter((item) => item.name)
+    .slice(0, 24)
+  const stickerNames = stickerList.map((item) => item.name)
+  const latestInbound = (Array.isArray(inboundUpdates) ? inboundUpdates : [])
+    .map((item, index) => normalizeInboundUpdate(item, index))
+    .reverse()
+    .find((item) => item.content) || null
   const history = (Array.isArray(mergedMessages) ? mergedMessages : [])
-    .slice(-18)
+    .slice(-contextMessageCount)
     .map((message) => ({
       role: normalizeText(message?.role) === 'user' ? 'user' : 'assistant',
       content: normalizeText(message?.originalText || message?.text || message?.content)
@@ -596,17 +837,30 @@ function buildDirectReplyMessages({ contact = null, mergedMessages = [], inbound
       content: [
         `你正在扮演微信聊天对象「${roleName}」。`,
         persona ? `角色设定：${persona}` : '',
-        '请只输出要发给用户的微信文本，不要解释，不要加 JSON，不要加舞台说明。',
+        contextBlock ? `以下是这条微信线程持久化的角色上下文，请优先遵守：\n${contextBlock}` : '',
+        '请只输出要发给用户的微信内容，不要解释，不要加 JSON，不要加舞台说明。',
         '不要加说话人标签或角色名前缀，例如不要输出「[Assistant]:」「Assistant:」「AI:」「角色:」。',
         '回复要自然、简短、像真实聊天。',
-        '如果需要分成多条微信气泡，请每条气泡单独占一行，最多 3 行。'
+        '如果需要分成多条微信气泡，请每条气泡单独占一行，最多 3 行。',
+        '如果要发表情包，必须严格使用格式 `[表情:名字]`。',
+        '表情包只允许使用当前可用名单里的名字，禁止编造不存在的名字。',
+        stickerNames.length ? `当前可用表情包：${stickerNames.join('、')}` : '当前没有额外表情包可用，请不要输出任何 `[表情:名字]`。',
+        ...stickerList.map((item) => `表情包说明：${item.name}${item.desc ? ` - ${item.desc}` : ''}`),
+        latestInbound?.content ? `这次必须优先直接回应用户刚刚最新发来的这句：${latestInbound.content}` : ''
       ].filter(Boolean).join('\n')
     },
     ...history
   ]
 }
 
-async function callDirectReplyModel({ settingsStore = null, contact = null, mergedMessages = [], inboundUpdates = [] } = {}) {
+async function callDirectReplyModel({
+  settingsStore = null,
+  contact = null,
+  mergedMessages = [],
+  inboundUpdates = [],
+  customStickers = [],
+  threadContext = null
+} = {}) {
   const endpoint = normalizeChatCompletionEndpoint(settingsStore?.baseUrl)
   const response = await fetch(endpoint, {
     method: 'POST',
@@ -616,7 +870,13 @@ async function callDirectReplyModel({ settingsStore = null, contact = null, merg
     },
     body: JSON.stringify({
       model: settingsStore.model,
-      messages: buildDirectReplyMessages({ contact, mergedMessages, inboundUpdates }),
+      messages: buildDirectReplyMessages({
+        contact,
+        mergedMessages,
+        inboundUpdates,
+        customStickers,
+        threadContext
+      }),
       temperature: 0.8
     })
   })
@@ -693,7 +953,17 @@ export function createWechatDaemonAutoReplyHandler(env = process.env) {
     })
     const baseMessages = Array.isArray(threadContext.messages) ? threadContext.messages : []
     const mergedMessages = mergeConversationMessages(baseMessages, normalizedInbound)
-    const contact = buildRoleContact(safeBinding, threadContext, mergedMessages)
+    const focusedMessages = focusConversationMessages(mergedMessages, normalizedInbound)
+    const effectiveMessages = focusedMessages.length ? focusedMessages : mergedMessages
+    const contact = buildRoleContact(safeBinding, threadContext, effectiveMessages)
+    let daemonDebug = buildDaemonDebugState({
+      autoBrainConfigured: isAutoBrainSsrEnabled(env),
+      fallbackUsed: true,
+      route: 'direct_fallback_pending',
+      fallbackReason: isAutoBrainSsrEnabled(env)
+        ? 'autobrain_not_attempted'
+        : 'wechat_daemon_autobrain_ssr_disabled'
+    })
     const settingsStore = await hydrateAiSettingsFromBackgroundKey({
       env,
       settingsStore: resolveAiSettings(env, threadContext),
@@ -724,7 +994,7 @@ export function createWechatDaemonAutoReplyHandler(env = process.env) {
           roleStore,
           momentsStore: buildMomentsStore(threadContext),
           contact,
-          messages: { value: mergedMessages },
+          messages: { value: effectiveMessages },
           customStickers: Array.isArray(threadContext.customStickers) ? threadContext.customStickers : [],
           avatarPresets: Array.isArray(threadContext.avatarPresets) ? threadContext.avatarPresets : [],
           worldBookEntries: Array.isArray(threadContext.worldBookEntries) ? threadContext.worldBookEntries : [],
@@ -739,7 +1009,32 @@ export function createWechatDaemonAutoReplyHandler(env = process.env) {
           runtimeProviders
         })
         replyAction = findReplyAction(plan)
+        daemonDebug = replyAction
+          ? buildDaemonDebugState({
+              autoBrainConfigured: true,
+              autoBrainAttempted: true,
+              autoBrainSucceeded: true,
+              fallbackUsed: false,
+              route: 'autobrain_success'
+            })
+          : buildDaemonDebugState({
+              autoBrainConfigured: true,
+              autoBrainAttempted: true,
+              autoBrainSucceeded: false,
+              fallbackUsed: true,
+              route: 'autobrain_empty_fallback',
+              fallbackReason: 'wechat_daemon_autobrain_no_reply_action'
+            })
       } catch (error) {
+        daemonDebug = buildDaemonDebugState({
+          autoBrainConfigured: isAutoBrainSsrEnabled(env),
+          autoBrainAttempted: isAutoBrainSsrEnabled(env),
+          autoBrainSucceeded: false,
+          fallbackUsed: true,
+          route: 'autobrain_failed_fallback',
+          error: normalizeText(error?.message || error),
+          fallbackReason: normalizeText(error?.message || error)
+        })
         if (normalizeText(env.WECHAT_DAEMON_DISABLE_DIRECT_AI_FALLBACK) === '1') {
           throw error
         }
@@ -750,8 +1045,15 @@ export function createWechatDaemonAutoReplyHandler(env = process.env) {
       replyAction = await callDirectReplyModel({
         settingsStore,
         contact,
-        mergedMessages,
-        inboundUpdates: normalizedInbound
+        mergedMessages: effectiveMessages,
+        inboundUpdates: normalizedInbound,
+        customStickers: Array.isArray(threadContext.customStickers) ? threadContext.customStickers : [],
+        threadContext
+      })
+      daemonDebug = buildDaemonDebugState({
+        ...daemonDebug,
+        fallbackUsed: true,
+        route: normalizeText(daemonDebug.route) || 'direct_fallback_used'
       })
     }
 
@@ -761,7 +1063,8 @@ export function createWechatDaemonAutoReplyHandler(env = process.env) {
     const outboxMessages = buildOutboxMessages({
       binding: safeBinding,
       inboundUpdates: normalizedInbound,
-      replyAction
+      replyAction,
+      customStickers: Array.isArray(threadContext.customStickers) ? threadContext.customStickers : []
     })
     if (!outboxMessages.length) {
       throw new Error('wechat_daemon_auto_reply_empty_outbox')
@@ -778,18 +1081,20 @@ export function createWechatDaemonAutoReplyHandler(env = process.env) {
     if (store && typeof store.appendThreadContextMessages === 'function') {
       const nextThreadMessages = [
         ...normalizedInbound.map((item, index) => buildInboundWechatMessage(item, index)),
-        ...buildReplyThreadContextMessages(replyAction)
+        ...buildReplyThreadContextMessages(
+          replyAction,
+          Array.isArray(threadContext.customStickers) ? threadContext.customStickers : []
+        )
       ]
-      if (nextThreadMessages.length) {
-        await store.appendThreadContextMessages(safeBinding.threadKey, nextThreadMessages, {
-          updatedAt: Date.now()
-        }).catch((error) => {
-          console.warn('[wechat-daemon] append thread context messages failed', {
-            threadKey: safeBinding.threadKey,
-            error
-          })
+      await store.appendThreadContextMessages(safeBinding.threadKey, nextThreadMessages, {
+        updatedAt: Date.now(),
+        snapshotPatch: { daemonDebug }
+      }).catch((error) => {
+        console.warn('[wechat-daemon] append thread context messages failed', {
+          threadKey: safeBinding.threadKey,
+          error
         })
-      }
+      })
     }
 
     return {

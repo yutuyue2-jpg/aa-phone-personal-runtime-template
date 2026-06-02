@@ -236,11 +236,19 @@ const normalizeThreadContextMomentPost = (post = {}) => {
 
 const normalizeThreadContextSticker = (item = {}) => {
   const safe = item && typeof item === 'object' ? item : {}
+  const mediaUrl = normalizeText(safe.mediaUrl || safe.imageUrl || safe.url || safe.src || safe.previewUrl)
   return {
     id: normalizeText(safe.id),
     name: normalizeText(safe.name),
+    title: normalizeText(safe.title || safe.name),
+    label: normalizeText(safe.label || safe.name),
     desc: normalizeText(safe.desc),
-    category: normalizeText(safe.category)
+    description: normalizeText(safe.description || safe.desc),
+    category: normalizeText(safe.category),
+    url: mediaUrl,
+    imageUrl: mediaUrl,
+    mediaUrl,
+    previewUrl: normalizeText(safe.previewUrl || mediaUrl)
   }
 }
 
@@ -311,6 +319,9 @@ const normalizeThreadContextSnapshot = (snapshot = {}) => {
       : null,
     directVisionMessage: safe.directVisionMessage && typeof safe.directVisionMessage === 'object'
       ? clone(safe.directVisionMessage)
+      : null,
+    daemonDebug: safe.daemonDebug && typeof safe.daemonDebug === 'object'
+      ? clone(safe.daemonDebug)
       : null
   }
 }
@@ -844,7 +855,7 @@ export function createWechatDaemonStore(env = process.env) {
     if (normalizeAutoReplyState(existing.autoReplyState) !== 'ready') return null
     const claimedUpdates = normalizeInboundUpdates(existing.pendingInboundUpdates)
     if (!claimedUpdates.length) return null
-    return upsertBinding({
+    const claimedBinding = await upsertBinding({
       ...existing,
       pendingInboundUpdates: [],
       processingInboundUpdates: claimedUpdates,
@@ -853,6 +864,12 @@ export function createWechatDaemonStore(env = process.env) {
       lastAutoReplyStartedAt: Date.now(),
       autoReplyLastError: '',
       nextAutoReplyAttemptAt: 0
+    })
+    if (!claimedBinding?.threadKey) return claimedBinding
+    if (normalizeInboundUpdates(claimedBinding.processingInboundUpdates).length) return claimedBinding
+    return normalizeBindingRecord({
+      ...claimedBinding,
+      processingInboundUpdates: claimedUpdates
     })
   }
 

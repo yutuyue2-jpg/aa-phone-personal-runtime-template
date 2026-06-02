@@ -507,7 +507,7 @@ const buildTextMessagePayload = (state = {}, input = {}) => {
 const aesEcbPaddedSize = (plaintextSize = 0) => Math.ceil((Number(plaintextSize || 0) + 1) / 16) * 16
 
 const encryptAesEcb = (buffer, key) => {
-  const cipher = nodeCrypto.createCipheriv('aes-128-ecb', key, null)
+  const cipher = nodeCrypto.createCipheriv('aes-128-ecb', key, Buffer.alloc(0))
   return Buffer.concat([cipher.update(buffer), cipher.final()])
 }
 
@@ -545,6 +545,26 @@ const fetchMediaBuffer = async (mediaUrl = '') => {
   }
 }
 
+const resolveWechatIlinkUploadUrl = (env = {}, state = {}, uploadResp = {}, filekey = '') => {
+  const safe = uploadResp && typeof uploadResp === 'object' ? uploadResp : {}
+  const nested = safe.data && typeof safe.data === 'object' ? safe.data : {}
+  const uploadFullUrl = normalizeText(
+    safe.upload_full_url
+      || safe.uploadFullUrl
+      || nested.upload_full_url
+      || nested.uploadFullUrl
+  )
+  if (isPublicHttpUrl(uploadFullUrl)) return uploadFullUrl
+  const uploadParam = normalizeText(
+    safe.upload_param
+      || safe.uploadParam
+      || nested.upload_param
+      || nested.uploadParam
+  )
+  if (!uploadParam) return ''
+  return `${resolveIlinkCdnBaseUrl(env, state)}/upload?encrypted_query_param=${encodeURIComponent(uploadParam)}&filekey=${encodeURIComponent(filekey)}`
+}
+
 const uploadWechatIlinkImageFromUrl = async ({
   env = {},
   state = {},
@@ -568,16 +588,15 @@ const uploadWechatIlinkImageFromUrl = async ({
     no_need_thumb: true,
     aeskey: aeskey.toString('hex')
   }, env)
-  const uploadParam = normalizeText(uploadResp.upload_param)
-  if (!uploadParam) {
+  const uploadUrl = resolveWechatIlinkUploadUrl(env, state, uploadResp, filekey)
+  if (!uploadUrl) {
     const error = new Error('wechat_media_upload_param_missing')
     error.status = 502
     error.payload = uploadResp
     throw error
   }
-  const cdnUrl = `${resolveIlinkCdnBaseUrl(env, state)}/upload?encrypted_query_param=${encodeURIComponent(uploadParam)}&filekey=${encodeURIComponent(filekey)}`
   const ciphertext = encryptAesEcb(buffer, aeskey)
-  const uploadResult = await fetch(cdnUrl, {
+  const uploadResult = await fetch(uploadUrl, {
     method: 'POST',
     headers: { 'content-type': 'application/octet-stream' },
     body: new Uint8Array(ciphertext)
@@ -779,6 +798,7 @@ export const syncWechatIlinkBinding = async ({
   const bindingAccess = await resolveWechatBindingAccess(env, { bindingId, threadMeta })
   const state = bindingAccess.state
   const resolvedThreadMeta = bindingAccess.threadMeta
+  const existingBinding = await getWechatDaemonBindingByThreadMeta(env, resolvedThreadMeta)
   const baseUrl = getIlinkBaseUrl(env, state)
   const payload = await ilinkBusinessFetchJson(`${baseUrl}/ilink/bot/getupdates`, state, {
     get_updates_buf: normalizeText(state.syncBuf)
@@ -800,6 +820,7 @@ export const syncWechatIlinkBinding = async ({
     syncBuf: normalizeText(payload.get_updates_buf || payload.syncbuf || payload.next_syncbuf || state.syncBuf),
     contextByUser
   }))
+  const latestInbound = [...inboundUpdates].reverse().find((item) => item.from || item.contextToken) || null
   const latestInboundAt = inboundUpdates.reduce(
     (maxTs, update) => Math.max(maxTs, Number(update?.createdAt || 0)),
     0
@@ -810,7 +831,9 @@ export const syncWechatIlinkBinding = async ({
     remoteBindingId: nextBindingId,
     externalAccountId: normalizeText(state?.botId),
     lastSyncedAt: Date.now(),
-    lastInboundAt: latestInboundAt || 0,
+    lastInboundAt: latestInboundAt || Number(existingBinding?.lastInboundAt || 0),
+    lastInboundFrom: normalizeText(latestInbound?.from || existingBinding?.lastInboundFrom),
+    lastInboundContextToken: normalizeText(latestInbound?.contextToken || existingBinding?.lastInboundContextToken),
     lastError: ''
   })
   if (inboundUpdates.length) {
@@ -827,9 +850,12 @@ export const syncWechatIlinkBinding = async ({
   const latestBinding = daemonStore
     ? await daemonStore.getBindingByThreadKey(resolvedThreadMeta.threadKey).catch(() => null)
     : null
+  const recentInboundUpdates = Array.isArray(latestBinding?.recentInboundUpdates)
+    ? latestBinding.recentInboundUpdates
+    : []
   return {
     updates: inboundUpdates,
-    recentInboundUpdates: [],
+    recentInboundUpdates: recentInboundUpdates.length ? recentInboundUpdates : inboundUpdates,
     recentThreadMessages: listRecentThreadContextMessages(latestBinding),
     bindingId: nextBindingId,
     remoteBindingId: nextBindingId,

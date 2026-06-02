@@ -175,8 +175,9 @@ export function createWechatDaemonRuntime(env = process.env) {
     const safeBinding = binding && typeof binding === 'object' ? binding : {}
     const threadKey = normalizeText(safeBinding.threadKey)
     if (!threadKey) return
-    const errorText = buildVisibleAutoReplyError(error)
     const errorKey = normalizeText(error?.message || error || 'unknown')
+    if (errorKey === 'wechat_daemon_inbound_updates_missing') return
+    const errorText = buildVisibleAutoReplyError(error)
     const threadContext = safeBinding.threadContextSnapshot && typeof safeBinding.threadContextSnapshot === 'object'
       ? safeBinding.threadContextSnapshot
       : {}
@@ -571,6 +572,24 @@ export function createWechatDaemonRuntime(env = process.env) {
 
   const getStatus = async () => {
     const bindings = await store.listBindings()
+    const threadSummaries = bindings.slice(0, 10).map((item) => {
+      const daemonDebug = item?.threadContextSnapshot?.daemonDebug && typeof item.threadContextSnapshot.daemonDebug === 'object'
+        ? item.threadContextSnapshot.daemonDebug
+        : {}
+      return {
+        threadKey: normalizeText(item?.threadKey),
+        autoReplyState: normalizeText(item?.autoReplyState),
+        lastInboundAt: Number(item?.lastInboundAt || 0),
+        lastAutoReplyCompletedAt: Number(item?.lastAutoReplyCompletedAt || 0),
+        autoBrainConfigured: daemonDebug.autoBrainConfigured === true,
+        autoBrainAttempted: daemonDebug.autoBrainAttempted === true,
+        autoBrainSucceeded: daemonDebug.autoBrainSucceeded === true,
+        fallbackUsed: daemonDebug.fallbackUsed === true,
+        route: normalizeText(daemonDebug.route),
+        fallbackReason: normalizeText(daemonDebug.fallbackReason),
+        routeError: normalizeText(daemonDebug.error)
+      }
+    })
     return {
       ok: true,
       service: 'wechat-daemon-runtime',
@@ -588,6 +607,7 @@ export function createWechatDaemonRuntime(env = process.env) {
       threadCount: bindings.length,
       pendingOutboxCount: (await outboxStore.listPendingMessages(200, Date.now())).length,
       threadKeys: bindings.map((item) => item.threadKey).filter(Boolean).slice(0, 20),
+      threadSummaries,
       storeFilePath: store.filePath
     }
   }
@@ -609,7 +629,8 @@ export function createWechatDaemonRuntime(env = process.env) {
       autoReplyHandlerEnabled: status.autoReplyHandlerEnabled,
       lastError: status.lastError,
       threadCount: status.threadCount,
-      pendingOutboxCount: status.pendingOutboxCount
+      pendingOutboxCount: status.pendingOutboxCount,
+      threadSummaries: Array.isArray(status.threadSummaries) ? status.threadSummaries : []
     }
   }
 

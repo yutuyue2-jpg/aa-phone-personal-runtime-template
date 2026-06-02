@@ -24,6 +24,10 @@ import { handleWechatBridgeProxy } from './wechat/wechatBridgeProxy.js'
 import { createWechatDaemonAutoReplyHandler } from './wechat/wechatDaemonAutoReplyHandler.js'
 import { createWechatDaemonRuntime } from './wechat/wechatDaemonRuntime.js'
 import {
+  buildWechatDaemonThreadKey,
+  getWechatDaemonStore
+} from './wechat/wechatDaemonStore.js'
+import {
   PROACTIVE_PENDING_LIMIT as SHARED_PROACTIVE_PENDING_LIMIT,
   buildProactiveRequestMessages,
   calculateProactiveDelay as sharedCalculateProactiveDelay,
@@ -45,6 +49,7 @@ const PROACTIVE_PENDING_LIMIT = SHARED_PROACTIVE_PENDING_LIMIT
 const MAX_INTERNAL_CHAT_MESSAGES = 64
 const VAPID_SETTING_KEY = 'vapid:keypair'
 const ENCRYPTED_PAYLOAD_VERSION = 1
+const RECENT_WECHAT_DAEMON_SUPPRESS_MS = 15 * 60 * 1000
 
 const json = (payload = {}, init = {}) => new Response(JSON.stringify(payload), {
   status: init.status || 200,
@@ -415,11 +420,46 @@ const buildWechatOutboxThreadMeta = (role = null, thread = null) => {
   }
 }
 
+const shouldSuppressBackgroundProactiveForWechatThread = async (env, role = null, now = Date.now()) => {
+  const thread = getBoundWechatThreadForRole(role)
+  if (!thread) return { suppress: false, reason: '' }
+  const threadMeta = buildWechatOutboxThreadMeta(role, thread)
+  if (!threadMeta.roleId || !threadMeta.chatId) return { suppress: false, reason: '' }
+  const runtime = createWechatDaemonRuntimeForWorker(env)
+  const bindings = await runtime.store.listBindings().catch(() => [])
+  const binding = (Array.isArray(bindings) ? bindings : []).find((item) => (
+    String(item?.roleId || '').trim() === threadMeta.roleId
+    && String(item?.accountId || '').trim() === threadMeta.accountId
+    && String(item?.identity || 'main').trim() === threadMeta.identity
+    && String(item?.chatId || '').trim() === threadMeta.chatId
+  ))
+  if (!binding) return { suppress: false, reason: '' }
+  if (Math.max(0, Number(binding?.pendingInboundCount || 0), Number(binding?.processingInboundCount || 0)) > 0) {
+    return { suppress: true, reason: 'wechat_daemon_inbound_pending' }
+  }
+  const lastInboundAt = Math.max(0, Number(binding?.lastInboundAt || 0))
+  const lastAutoReplyAt = Math.max(
+    0,
+    Number(binding?.lastAutoReplyQueuedAt || 0),
+    Number(binding?.lastAutoReplyCompletedAt || 0)
+  )
+  if (
+    lastInboundAt > 0
+    && lastAutoReplyAt >= lastInboundAt
+    && (now - lastAutoReplyAt) <= RECENT_WECHAT_DAEMON_SUPPRESS_MS
+  ) {
+    return { suppress: true, reason: 'recent_wechat_daemon_auto_reply' }
+  }
+  return { suppress: false, reason: '' }
+}
+
 const isWechatMediaUrl = (value = '') => /^https?:\/\//i.test(trimText(value, 1000))
 
 const getStickerTokenCandidates = (sticker = {}) => [
   sticker?.token,
   sticker?.name,
+  sticker?.title,
+  sticker?.label,
   sticker?.desc,
   sticker?.description
 ]
@@ -451,7 +491,7 @@ const buildRenderableWechatItems = (rawText = '', role = {}) => {
       const stickerName = trimText(stickerMatch[1], 120)
       const mediaUrl = resolveStickerMediaUrl(role, stickerName)
       items.push(mediaUrl
-        ? { type: 'image', content: line, caption: '', mediaUrl }
+        ? { type: 'image', content: line, caption: line, mediaUrl }
         : { type: 'text', content: line })
       continue
     }
@@ -460,7 +500,7 @@ const buildRenderableWechatItems = (rawText = '', role = {}) => {
     if (imageMatch) {
       const mediaUrl = trimText(imageMatch[1], 1000)
       items.push(isWechatMediaUrl(mediaUrl)
-        ? { type: 'image', content: '[图片]', caption: '', mediaUrl }
+        ? { type: 'image', content: '[图片]', caption: '[图片]', mediaUrl }
         : { type: 'text', content: line })
       continue
     }
@@ -502,8 +542,171 @@ const buildPendingPromptBlock = (messages = [], role = null, now = Date.now()) =
   }).join('\n')
 }
 
+const normalizeProactiveContextMessage = (message = {}, fallbackIndex = 0) => {
+  if (!message || typeof message !== 'object') return null
+  const role = String(message?.role || message?.sender || '').trim().toLowerCase()
+  const normalizedRole = ['user', 'assistant', 'ai'].includes(role)
+    ? (role === 'ai' ? 'assistant' : role)
+    : (message?.isUser === true ? 'user' : 'assistant')
+  const text = trimText(
+    message?.originalText
+    || message?.text
+    || message?.content
+    || message?.transcript
+    || message?.description
+    || message?.caption
+    || '',
+    1200
+  )
+  const type = trimText(message?.type || 'text', 40) || 'text'
+  const timestamp = Math.max(0, Number(message?.timestamp || message?.createdAt || message?.time || 0)) || fallbackIndex
+  if (!text && type !== 'image') return null
+  return {
+    id: trimText(message?.id || message?.messageId || message?.externalWechatMessageId || '', 180),
+    role: normalizedRole === 'assistant' ? 'ai' : normalizedRole,
+    type,
+    text: text || (type === 'image' ? '[图片]' : ''),
+    originalText: text,
+    timestamp,
+    source: trimText(message?.source || '', 80)
+  }
+}
+
+const buildMessageMergeKey = (message = {}, fallbackIndex = 0) => {
+  const safeId = trimText(message?.id || '', 180)
+  if (safeId) return `id:${safeId}`
+  return [
+    'fallback',
+    trimText(message?.role || '', 20),
+    trimText(message?.type || 'text', 40),
+    Math.max(0, Number(message?.timestamp || 0)),
+    trimText(message?.text || message?.originalText || '', 200),
+    fallbackIndex
+  ].join(':')
+}
+
+const mergeProactiveRecentMessages = (...sources) => {
+  const merged = []
+  const indexByKey = new Map()
+  sources.forEach((source) => {
+    const list = Array.isArray(source) ? source : []
+    list.forEach((message, index) => {
+      const normalized = normalizeProactiveContextMessage(message, index)
+      if (!normalized) return
+      const key = buildMessageMergeKey(normalized, index)
+      const existingIndex = indexByKey.get(key)
+      if (existingIndex === undefined) {
+        indexByKey.set(key, merged.length)
+        merged.push(normalized)
+        return
+      }
+      merged.splice(existingIndex, 1, {
+        ...merged[existingIndex],
+        ...normalized,
+        id: trimText(merged[existingIndex]?.id || normalized.id, 180)
+      })
+    })
+  })
+  return merged
+    .map((message, index) => ({ message, index }))
+    .sort((left, right) => {
+      const timeDiff = Number(left.message?.timestamp || left.index) - Number(right.message?.timestamp || right.index)
+      return timeDiff === 0 ? left.index - right.index : timeDiff
+    })
+    .map(({ message }) => message)
+    .slice(-48)
+}
+
+const normalizeProactiveSticker = (sticker = {}, fallbackIndex = 0) => {
+  const safe = sticker && typeof sticker === 'object' ? sticker : {}
+  const mediaUrl = trimText(safe.mediaUrl || safe.imageUrl || safe.url || safe.src || safe.previewUrl, 1000)
+  const name = trimText(safe.name || safe.title || safe.label || safe.token || safe.desc || safe.description || '', 160)
+  if (!name && !mediaUrl) return null
+  return {
+    id: trimText(safe.id || `sticker_${fallbackIndex}`, 180),
+    token: trimText(safe.token || name, 160),
+    name,
+    title: trimText(safe.title || name, 160),
+    label: trimText(safe.label || name, 160),
+    desc: trimText(safe.desc || safe.description || name, 240),
+    description: trimText(safe.description || safe.desc || name, 240),
+    category: trimText(safe.category || '', 80),
+    url: mediaUrl,
+    imageUrl: mediaUrl,
+    mediaUrl,
+    previewUrl: trimText(safe.previewUrl || mediaUrl, 1000)
+  }
+}
+
+const buildStickerMergeKey = (sticker = {}, fallbackIndex = 0) => {
+  const mediaUrl = trimText(sticker?.mediaUrl || sticker?.imageUrl || sticker?.url || '', 1000)
+  if (mediaUrl) return `url:${mediaUrl}`
+  const token = trimText(sticker?.token || sticker?.name || sticker?.title || sticker?.label || sticker?.desc || sticker?.description || '', 160).toLowerCase()
+  return token ? `token:${token}` : `fallback:${fallbackIndex}`
+}
+
+const mergeProactiveStickers = (...sources) => {
+  const merged = []
+  const indexByKey = new Map()
+  sources.forEach((source) => {
+    const list = Array.isArray(source) ? source : []
+    list.forEach((sticker, index) => {
+      const normalized = normalizeProactiveSticker(sticker, index)
+      if (!normalized) return
+      const key = buildStickerMergeKey(normalized, index)
+      const existingIndex = indexByKey.get(key)
+      if (existingIndex === undefined) {
+        indexByKey.set(key, merged.length)
+        merged.push(normalized)
+        return
+      }
+      merged.splice(existingIndex, 1, {
+        ...merged[existingIndex],
+        ...normalized,
+        id: trimText(merged[existingIndex]?.id || normalized.id, 180)
+      })
+    })
+  })
+  return merged.slice(0, 80)
+}
+
+const getWechatThreadContextSnapshotForRole = async (env, role = null) => {
+  const thread = getBoundWechatThreadForRole(role)
+  if (!thread) return {}
+  const threadKey = buildWechatDaemonThreadKey(buildWechatOutboxThreadMeta(role, thread))
+  if (!threadKey) return {}
+  const store = getWechatDaemonStore(env)
+  const binding = await store.getBindingByThreadKey(threadKey).catch(() => null)
+  const snapshot = binding?.threadContextSnapshot && typeof binding.threadContextSnapshot === 'object'
+    ? binding.threadContextSnapshot
+    : {}
+  return snapshot
+}
+
+const getWechatThreadContextMessagesForRole = async (env, role = null) => {
+  const snapshot = await getWechatThreadContextSnapshotForRole(env, role)
+  return Array.isArray(snapshot.messages) ? snapshot.messages : []
+}
+
+const hydrateRoleWithWechatContext = async (env, role = null) => {
+  const pwaMessages = Array.isArray(role?.recentMessages) ? role.recentMessages : []
+  const wechatSnapshot = await getWechatThreadContextSnapshotForRole(env, role).catch(() => ({}))
+  const wechatMessages = Array.isArray(wechatSnapshot?.messages) ? wechatSnapshot.messages : []
+  const recentMessages = mergeProactiveRecentMessages(pwaMessages, wechatMessages)
+  const stickers = mergeProactiveStickers(
+    role?.stickers,
+    wechatSnapshot?.customStickers,
+    wechatSnapshot?.stickers
+  )
+  return {
+    ...(role && typeof role === 'object' ? role : {}),
+    recentMessages,
+    stickers
+  }
+}
+
 const buildRequestMessagesForRole = (snapshot, role, pendingMessages = []) => {
-  const recentMessages = Array.isArray(role?.recentMessages) ? role.recentMessages : []
+  const recentMessages = mergeProactiveRecentMessages(role?.recentMessages || [])
   const latestUserMessage = findLatestProactiveUserMessage(recentMessages)
   const latestVisibleMessage = recentMessages.length ? recentMessages[recentMessages.length - 1] : null
   const proactiveMode = String(latestVisibleMessage?.role || '') === 'user'
@@ -704,7 +907,7 @@ const handleWechatRequest = async (request, env, ctx = null) => {
     })
     if (ctx?.waitUntil) {
       ctx.waitUntil(tickPromise)
-      if (routePath === '/wechat/outbox/enqueue') {
+      if (routePath === '/wechat/outbox/enqueue' || routePath === '/wechat/sync-now') {
         await tickPromise
       }
     } else {
@@ -1019,14 +1222,17 @@ const runDevice = async (env, deviceId, { force = false } = {}) => {
         roles: (Array.isArray(snapshot?.roles) ? snapshot.roles : []).filter(roleHasBoundWechatBridge)
       }
     : snapshot
-  const role = sharedChooseProactiveRole(eligibleSnapshot)
-  if (appIsForeground && !role) {
+  const selectedRole = sharedChooseProactiveRole(eligibleSnapshot)
+  if (appIsForeground && !selectedRole) {
     return {
       generated: false,
       reason: 'app_foreground_no_bound_wechat_role',
       foregroundUntil: Number(activity.foregroundUntil || 0)
     }
   }
+  const role = selectedRole
+    ? await hydrateRoleWithWechatContext(env, selectedRole)
+    : selectedRole
   const decision = sharedShouldRunProactiveForRole({ snapshot, role, now, force })
   const nextCheckAt = now + sharedCalculateProactiveDelay(snapshot?.autoMessage || {})
   await putBackgroundState(env, deviceId, {
@@ -1036,6 +1242,19 @@ const runDevice = async (env, deviceId, { force = false } = {}) => {
     lastSkipReason: decision.ok ? '' : decision.reason
   })
   if (!decision.ok) return { generated: false, reason: decision.reason }
+  const wechatSuppression = await shouldSuppressBackgroundProactiveForWechatThread(env, role, now).catch((error) => ({
+    suppress: false,
+    reason: String(error?.message || error || '')
+  }))
+  if (wechatSuppression?.suppress) {
+    await putBackgroundState(env, deviceId, {
+      ...state,
+      nextCheckAt,
+      lastCheckedAt: now,
+      lastSkipReason: wechatSuppression.reason || 'wechat_daemon_suppressed'
+    })
+    return { generated: false, reason: wechatSuppression.reason || 'wechat_daemon_suppressed' }
+  }
 
   const messages = buildRequestMessagesForRole(snapshot, role, pendingMessages)
   const rawText = await callBackgroundModel({ keyConfig, messages })
@@ -1270,6 +1489,9 @@ export default {
   async scheduled(_event, env, ctx) {
     ctx.waitUntil((async () => {
       assertDb(env)
+      await createWechatDaemonRuntimeForWorker(env).tick().catch((error) => {
+        console.warn('[personal-runtime] scheduled wechat daemon tick failed', error)
+      })
       const devices = await listBackgroundDeviceIds(env, MAX_DEVICES_PER_CRON)
       const maxGenerations = Number(env.MAX_GENERATIONS_PER_CRON || DEFAULT_MAX_GENERATIONS_PER_CRON)
       let generatedCount = 0
@@ -1289,7 +1511,7 @@ export default {
         }
       }
       await createWechatDaemonRuntimeForWorker(env).tick().catch((error) => {
-        console.warn('[personal-runtime] scheduled wechat daemon tick failed', error)
+        console.warn('[personal-runtime] scheduled post-background wechat daemon tick failed', error)
       })
     })())
   }
