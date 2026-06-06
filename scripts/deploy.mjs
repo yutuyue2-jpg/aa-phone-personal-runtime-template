@@ -70,12 +70,19 @@ const collectLogWindows = (lines = [], patterns = []) => {
 
 const printLatestWranglerLogDiagnostics = () => {
   const logPath = getLatestWranglerLog()
+  console.error('===== AI_PHONE_DEPLOY_ERROR_START =====')
   if (!logPath) {
     console.error('[personal-runtime-deploy] no wrangler log file found')
+    console.error('===== AI_PHONE_DEPLOY_ERROR_END =====')
     return
   }
   const content = fs.readFileSync(logPath, 'utf8')
   const lines = content.split(/\r?\n/)
+  const hasSchedulesFailure = /\/schedules\b/i.test(content)
+  if (hasSchedulesFailure) {
+    console.error('[personal-runtime-deploy] detected Cloudflare Cron Trigger schedules API failure')
+    console.error('[personal-runtime-deploy] Worker code may still be uploaded, but Cloudflare rejected the cron trigger deployment.')
+  }
   const windows = collectLogWindows(lines, [
     /\/schedules\b/i,
     /Some triggers failed/i,
@@ -93,6 +100,7 @@ const printLatestWranglerLogDiagnostics = () => {
   }
   console.error('[personal-runtime-deploy] wrangler log tail:')
   console.error(redactLog(tail))
+  console.error('===== AI_PHONE_DEPLOY_ERROR_END =====')
 }
 
 try {
@@ -100,6 +108,7 @@ try {
   run('ensure runtime secrets', npmCommand, ['run', 'secrets:ensure'])
   run('deploy worker with cron triggers', process.execPath, [wranglerCli, 'deploy'], {
     env: {
+      WRANGLER_LOG: 'debug',
       WRANGLER_LOG_SANITIZE: 'false'
     }
   })
