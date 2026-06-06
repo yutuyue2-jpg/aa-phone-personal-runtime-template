@@ -49,15 +49,15 @@ const getLatestWranglerLog = () => {
   return logs[0]?.filePath || null
 }
 
-const collectLogWindows = (lines = [], patterns = []) => {
+const collectLogWindows = (lines = [], patterns = [], before = 40, after = 80) => {
   const indexes = []
   lines.forEach((line, index) => {
     if (patterns.some((pattern) => pattern.test(line))) indexes.push(index)
   })
   const ranges = []
   indexes.forEach((index) => {
-    const start = Math.max(0, index - 80)
-    const end = Math.min(lines.length, index + 100)
+    const start = Math.max(0, index - before)
+    const end = Math.min(lines.length, index + after)
     const last = ranges[ranges.length - 1]
     if (last && start <= last.end) {
       last.end = Math.max(last.end, end)
@@ -86,10 +86,8 @@ const printLatestWranglerLogDiagnostics = () => {
   const windows = collectLogWindows(lines, [
     /\/schedules\b/i,
     /Some triggers failed/i,
-    /START CF API RESPONSE/i,
-    /ERROR/i
-  ])
-  const tail = lines.slice(-220).join('\n')
+    /workers\/scripts\/[^/]+\/schedules/i
+  ], 30, 70)
   console.error(`[personal-runtime-deploy] latest wrangler log: ${logPath}`)
   if (windows.length) {
     console.error('[personal-runtime-deploy] focused wrangler log excerpts:')
@@ -98,8 +96,6 @@ const printLatestWranglerLogDiagnostics = () => {
       console.error(redactLog(window))
     })
   }
-  console.error('[personal-runtime-deploy] wrangler log tail:')
-  console.error(redactLog(tail))
   console.error('===== AI_PHONE_DEPLOY_ERROR_END =====')
 }
 
