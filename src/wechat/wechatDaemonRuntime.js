@@ -68,6 +68,32 @@ async function withTimeout(promise, timeoutMs = DEFAULT_AUTO_REPLY_HANDLER_TIMEO
 
 const sleep = (ms = 0) => new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms || 0))))
 
+function buildAutoReplyIdempotencyRoots(binding = {}) {
+  const threadKey = normalizeText(binding?.threadKey || binding?.chatId)
+  if (!threadKey) return []
+  return (Array.isArray(binding?.processingInboundUpdates) ? binding.processingInboundUpdates : [])
+    .map((item) => {
+      const inboundId = normalizeText(item?.id || item?.createdAt)
+      if (!inboundId) return ''
+      return ['wechat_daemon_auto_reply', threadKey, inboundId].join(':')
+    })
+    .filter(Boolean)
+}
+
+async function hasQueuedAutoReplyForCurrentInbound(outboxStore = null, binding = {}) {
+  if (!outboxStore || typeof outboxStore.listMessages !== 'function') return false
+  const threadKey = normalizeText(binding?.threadKey)
+  const roots = buildAutoReplyIdempotencyRoots(binding)
+  if (!threadKey || !roots.length) return false
+  const messages = await outboxStore.listMessages()
+  return (Array.isArray(messages) ? messages : []).some((message) => {
+    if (normalizeText(message?.threadKey) !== threadKey) return false
+    if (normalizeText(message?.source) !== 'daemon_auto_reply') return false
+    const key = normalizeText(message?.idempotencyKey)
+    return roots.some((root) => key === root || key.startsWith(`${root}:`))
+  })
+}
+
 function isAutoReplyReady(binding = {}, now = Date.now()) {
   const bindingId = normalizeText(binding?.bindingId || binding?.remoteBindingId)
   const bindingStatus = normalizeText(binding?.status)
@@ -227,6 +253,15 @@ export function createWechatDaemonRuntime(env = process.env) {
     if (!binding?.threadKey || typeof autoReplyHandler !== 'function') return false
     const claimedBinding = await store.claimAutoReplyThread(binding.threadKey)
     if (!claimedBinding?.threadKey) return false
+    const alreadyQueued = await hasQueuedAutoReplyForCurrentInbound(outboxStore, claimedBinding).catch(() => false)
+    if (alreadyQueued) {
+      await store.completeAutoReplyThread(binding.threadKey, {
+        lastAutoReplyQueuedAt: Date.now(),
+        lastError: '',
+        autoReplyLastError: ''
+      })
+      return true
+    }
     let stopTyping = async () => {}
     try {
       stopTyping = await startWechatTypingIndicator(claimedBinding).catch((error) => {
@@ -257,6 +292,19 @@ export function createWechatDaemonRuntime(env = process.env) {
       })
       return true
     } catch (error) {
+      const partialReplyQueued = await hasQueuedAutoReplyForCurrentInbound(outboxStore, claimedBinding).catch(() => false)
+      if (partialReplyQueued) {
+        await store.completeAutoReplyThread(binding.threadKey, {
+          lastAutoReplyQueuedAt: Date.now(),
+          lastError: normalizeText(error?.message || error),
+          autoReplyLastError: normalizeText(error?.message || error)
+        })
+        console.warn('[wechat-daemon] auto reply partially queued before failure; skip retry', {
+          threadKey: claimedBinding?.threadKey,
+          error
+        })
+        return true
+      }
       await store.failAutoReplyThread(binding.threadKey, {
         lastError: normalizeText(error?.message || error),
         autoReplyLastError: normalizeText(error?.message || error),
@@ -329,218 +377,274 @@ export function createWechatDaemonRuntime(env = process.env) {
     })
   }
 
-  const tick = async () => {
-    if (state.tickInFlight) return
-    state.tickInFlight = true
-    state.lastTickAt = Date.now()
-    try {
-      const bindings = await store.listBindings()
-      let syncedThreadCount = 0
-      let updateCount = 0
-      for (const binding of bindings) {
-        const bindingId = normalizeText(binding?.bindingId || binding?.remoteBindingId)
-        if (!bindingId) continue
-        const bindingStatus = normalizeText(binding?.status)
-        if (bindingStatus && !['bound', 'pending'].includes(bindingStatus)) continue
+  const syncBindings = async () => {
+    const bindings = await store.listBindings()
+    const syncCandidates = bindings.filter((binding) => {
+      const bindingId = normalizeText(binding?.bindingId || binding?.remoteBindingId)
+      const bindingStatus = normalizeText(binding?.status)
+      return !!bindingId && (!bindingStatus || ['bound', 'pending'].includes(bindingStatus))
+    })
+    if (!syncCandidates.length) {
+      return { syncedThreadCount: 0, updateCount: 0 }
+    }
+    const results = await Promise.allSettled(syncCandidates.map(async (binding) => {
+      const bindingId = normalizeText(binding?.bindingId || binding?.remoteBindingId)
+      const bindingStatus = normalizeText(binding?.status)
+      if (bindingStatus !== 'bound') {
+        await store.patchBinding(binding, { status: 'bound', lastError: '' }).catch(() => null)
+      }
+      const result = await syncWechatIlinkBinding({
+        env,
+        bindingId,
+        threadMeta: binding
+      })
+      return {
+        threadKey: normalizeText(binding?.threadKey),
+        updateCount: Array.isArray(result?.updates) ? result.updates.length : 0
+      }
+    }))
+    let syncedThreadCount = 0
+    let updateCount = 0
+    for (let index = 0; index < results.length; index += 1) {
+      const result = results[index]
+      const binding = syncCandidates[index]
+      if (result.status === 'fulfilled') {
+        syncedThreadCount += 1
+        updateCount += Number(result.value?.updateCount || 0)
+        continue
+      }
+      await store.patchBinding(binding, {
+        lastError: normalizeText(result.reason?.message || result.reason),
+        lastSyncFailedAt: Date.now()
+      }).catch(() => null)
+      console.warn('[wechat-daemon] sync binding failed', {
+        threadKey: binding?.threadKey,
+        error: result.reason
+      })
+    }
+    return { syncedThreadCount, updateCount }
+  }
+
+  const processPendingWork = async ({ inlineQuietWaitMsOverride } = {}) => {
+    let refreshedBindings = await store.listBindings()
+    let recoveredAutoReplyCount = 0
+    let readyAutoReplyCount = 0
+    let processedAutoReplyCount = 0
+    const readyBindings = []
+    let now = Date.now()
+    const effectiveInlineQuietWaitMs = Math.max(
+      0,
+      Number.isFinite(Number(inlineQuietWaitMsOverride))
+        ? Number(inlineQuietWaitMsOverride)
+        : inlineQuietWaitMs
+    )
+    const inlineQuietWaits = refreshedBindings
+      .map((binding) => ({
+        pendingInboundCount: Number(binding?.pendingInboundCount || 0),
+        autoReplyState: normalizeText(binding?.autoReplyState || 'idle'),
+        quietUntilAt: Number(binding?.quietUntilAt || 0)
+      }))
+      .filter((item) => (
+        effectiveInlineQuietWaitMs > 0
+        && item.pendingInboundCount > 0
+        && item.autoReplyState === 'waiting_quiet'
+        && item.quietUntilAt > now
+        && item.quietUntilAt - now <= effectiveInlineQuietWaitMs
+      ))
+      .map((item) => item.quietUntilAt - now)
+    if (inlineQuietWaits.length) {
+      await sleep(Math.min(...inlineQuietWaits))
+      refreshedBindings = await store.listBindings()
+      now = Date.now()
+    }
+    for (const binding of refreshedBindings) {
+      const autoReplyState = normalizeText(binding?.autoReplyState || 'idle')
+      const startedAt = Number(binding?.lastAutoReplyStartedAt || 0)
+      const processingInboundCount = Number(binding?.processingInboundCount || 0)
+      if (
+        autoReplyState === 'processing'
+        && processingInboundCount > 0
+        && startedAt > 0
+        && now - startedAt > autoReplyHandlerTimeoutMs
+      ) {
+        await store.failAutoReplyThread(binding.threadKey, {
+          lastError: 'wechat_daemon_auto_reply_timeout',
+          autoReplyLastError: 'wechat_daemon_auto_reply_timeout',
+          retryDelayMs: 0
+        })
+        recoveredAutoReplyCount += 1
+      }
+    }
+    const replyCandidateBindings = recoveredAutoReplyCount > 0
+      ? await store.listBindings()
+      : refreshedBindings
+    for (const binding of replyCandidateBindings) {
+      const pendingInboundCount = Number(binding?.pendingInboundCount || 0)
+      const bindingId = normalizeText(binding?.bindingId || binding?.remoteBindingId)
+      const bindingStatus = normalizeText(binding?.status)
+      if (!bindingId) continue
+      if (bindingStatus && !['bound', 'pending'].includes(bindingStatus)) continue
+      if (binding?.wechatReplyTriggersAi === false) continue
+      if (pendingInboundCount <= 0) continue
+      const quietUntilAt = Number(binding?.quietUntilAt || 0)
+      const autoReplyState = normalizeText(binding?.autoReplyState || 'idle')
+      if (quietUntilAt > 0 && quietUntilAt <= now && autoReplyState !== 'ready') {
+        const readyBinding = await store.markAutoReplyReady(binding.threadKey)
+        readyAutoReplyCount += 1
+        if (readyBinding?.threadKey) readyBindings.push(readyBinding)
+        continue
+      }
+      if (isAutoReplyReady(binding, now)) {
+        readyAutoReplyCount += 1
+        readyBindings.push(binding)
+      }
+    }
+    if (typeof autoReplyHandler === 'function') {
+      for (const binding of readyBindings) {
         try {
-          if (bindingStatus !== 'bound') {
-            await store.patchBinding(binding, { status: 'bound', lastError: '' }).catch(() => null)
-          }
-          const result = await syncWechatIlinkBinding({
-            env,
-            bindingId,
-            threadMeta: binding
-          })
-          syncedThreadCount += 1
-          updateCount += Array.isArray(result?.updates) ? result.updates.length : 0
+          const handled = await processReadyAutoReplyThread(binding)
+          if (handled) processedAutoReplyCount += 1
         } catch (error) {
-          await store.patchBinding(binding, {
-            lastError: normalizeText(error?.message || error),
-            lastSyncFailedAt: Date.now()
-          }).catch(() => null)
-          console.warn('[wechat-daemon] sync binding failed', {
+          console.warn('[wechat-daemon] auto reply thread failed', {
             threadKey: binding?.threadKey,
             error
           })
         }
       }
-      let refreshedBindings = await store.listBindings()
-      let recoveredAutoReplyCount = 0
-      let readyAutoReplyCount = 0
-      let processedAutoReplyCount = 0
-      const readyBindings = []
-      let now = Date.now()
-      const inlineQuietWaits = refreshedBindings
-        .map((binding) => ({
-          pendingInboundCount: Number(binding?.pendingInboundCount || 0),
-          autoReplyState: normalizeText(binding?.autoReplyState || 'idle'),
-          quietUntilAt: Number(binding?.quietUntilAt || 0)
-        }))
-        .filter((item) => (
-          inlineQuietWaitMs > 0
-          && item.pendingInboundCount > 0
-          && item.autoReplyState === 'waiting_quiet'
-          && item.quietUntilAt > now
-          && item.quietUntilAt - now <= inlineQuietWaitMs
-        ))
-        .map((item) => item.quietUntilAt - now)
-      if (inlineQuietWaits.length) {
-        await sleep(Math.min(...inlineQuietWaits))
-        refreshedBindings = await store.listBindings()
-        now = Date.now()
+    }
+    const latestBindings = await store.listBindings()
+    const allOutboxMessages = await outboxStore.listMessages()
+    const latestSentAtByThread = buildLatestSentAtByThread(allOutboxMessages)
+    const pendingMessages = listDueOutboxMessages(allOutboxMessages, 20, Date.now())
+    for (const pendingMessage of pendingMessages) {
+      let claimedMessage = pendingMessage
+      const threadKey = normalizeText(pendingMessage.threadKey)
+      let binding = threadKey
+        ? await store.getBindingByThreadKey(threadKey).catch(() => null)
+        : null
+      if (!binding?.threadKey) {
+        binding = latestBindings.find((item) => item.threadKey === pendingMessage.threadKey)
       }
-      for (const binding of refreshedBindings) {
-        const autoReplyState = normalizeText(binding?.autoReplyState || 'idle')
-        const startedAt = Number(binding?.lastAutoReplyStartedAt || 0)
-        const processingInboundCount = Number(binding?.processingInboundCount || 0)
-        if (
-          autoReplyState === 'processing'
-          && processingInboundCount > 0
-          && startedAt > 0
-          && now - startedAt > autoReplyHandlerTimeoutMs
-        ) {
-          await store.failAutoReplyThread(binding.threadKey, {
-            lastError: 'wechat_daemon_auto_reply_timeout',
-            autoReplyLastError: 'wechat_daemon_auto_reply_timeout',
-            retryDelayMs: 0
-          })
-          recoveredAutoReplyCount += 1
-        }
+      const bindingId = normalizeText(binding?.bindingId || binding?.remoteBindingId || pendingMessage.bindingId || pendingMessage.remoteBindingId)
+      if (!bindingId) {
+        await outboxStore.patchMessage(pendingMessage.id, {
+          status: 'failed',
+          lastError: 'missing_binding_id',
+          attemptCount: Number(pendingMessage.attemptCount || 0) + 1,
+          nextAttemptAt: Date.now() + 60 * 1000
+        })
+        continue
       }
-      const replyCandidateBindings = recoveredAutoReplyCount > 0
-        ? await store.listBindings()
-        : refreshedBindings
-      for (const binding of replyCandidateBindings) {
-        const pendingInboundCount = Number(binding?.pendingInboundCount || 0)
-        const bindingId = normalizeText(binding?.bindingId || binding?.remoteBindingId)
-        const bindingStatus = normalizeText(binding?.status)
-        if (!bindingId) continue
-        if (bindingStatus && !['bound', 'pending'].includes(bindingStatus)) continue
-        if (binding?.wechatReplyTriggersAi === false) continue
-        if (pendingInboundCount <= 0) continue
-        const quietUntilAt = Number(binding?.quietUntilAt || 0)
-        const autoReplyState = normalizeText(binding?.autoReplyState || 'idle')
-        if (quietUntilAt > 0 && quietUntilAt <= now && autoReplyState !== 'ready') {
-          const readyBinding = await store.markAutoReplyReady(binding.threadKey)
-          readyAutoReplyCount += 1
-          if (readyBinding?.threadKey) readyBindings.push(readyBinding)
-          continue
-        }
-        if (isAutoReplyReady(binding, now)) {
-          readyAutoReplyCount += 1
-          readyBindings.push(binding)
-        }
-      }
-      if (typeof autoReplyHandler === 'function') {
-        for (const binding of readyBindings) {
-          try {
-            const handled = await processReadyAutoReplyThread(binding)
-            if (handled) processedAutoReplyCount += 1
-          } catch (error) {
-            console.warn('[wechat-daemon] auto reply thread failed', {
-              threadKey: binding?.threadKey,
-              error
+      try {
+        const activeThreadKey = normalizeText(pendingMessage.threadKey || binding?.threadKey)
+        const lastSentAt = Number(latestSentAtByThread.get(threadKey) || 0)
+        const nextAllowedAt = lastSentAt + state.outboxDeliveryGapMs
+        if (threadKey && state.outboxDeliveryGapMs > 0 && lastSentAt > 0 && nextAllowedAt > Date.now()) {
+          const waitMs = nextAllowedAt - Date.now()
+          if (waitMs > INLINE_OUTBOX_GAP_WAIT_LIMIT_MS) {
+            await outboxStore.patchMessage(pendingMessage.id, {
+              status: 'pending',
+              nextAttemptAt: nextAllowedAt
             })
+            continue
           }
+          await sendOutboxTypingStatus(binding, 1)
+          await sleep(waitMs)
         }
-      }
-      const latestBindings = await store.listBindings()
-      const allOutboxMessages = await outboxStore.listMessages()
-      const latestSentAtByThread = buildLatestSentAtByThread(allOutboxMessages)
-      const pendingMessages = listDueOutboxMessages(allOutboxMessages, 20, Date.now())
-      for (const pendingMessage of pendingMessages) {
-        let claimedMessage = pendingMessage
-        const binding = latestBindings.find((item) => item.threadKey === pendingMessage.threadKey)
-        const bindingId = normalizeText(binding?.bindingId || binding?.remoteBindingId || pendingMessage.bindingId || pendingMessage.remoteBindingId)
-        if (!bindingId) {
-          await outboxStore.patchMessage(pendingMessage.id, {
-            status: 'failed',
-            lastError: 'missing_binding_id',
-            attemptCount: Number(pendingMessage.attemptCount || 0) + 1,
-            nextAttemptAt: Date.now() + 60 * 1000
-          })
-          continue
+        const message = await outboxStore.claimMessage(pendingMessage.id, {
+          now: Date.now(),
+          leaseMs: DEFAULT_OUTBOX_SEND_LEASE_MS
+        })
+        if (!message?.id) continue
+        claimedMessage = message
+        const freshBinding = activeThreadKey
+          ? await store.getBindingByThreadKey(activeThreadKey).catch(() => null)
+          : null
+        if (freshBinding?.threadKey) {
+          binding = freshBinding
         }
-        try {
-          const threadKey = normalizeText(pendingMessage.threadKey || binding?.threadKey)
-          const lastSentAt = Number(latestSentAtByThread.get(threadKey) || 0)
-          const nextAllowedAt = lastSentAt + state.outboxDeliveryGapMs
-          if (threadKey && state.outboxDeliveryGapMs > 0 && lastSentAt > 0 && nextAllowedAt > Date.now()) {
-            const waitMs = nextAllowedAt - Date.now()
-            if (waitMs > INLINE_OUTBOX_GAP_WAIT_LIMIT_MS) {
-              await outboxStore.patchMessage(pendingMessage.id, {
-                status: 'pending',
-                nextAttemptAt: nextAllowedAt
-              })
-              continue
+        const freshBindingId = normalizeText(binding?.bindingId || binding?.remoteBindingId || message.bindingId || message.remoteBindingId)
+        const targetTo = normalizeText(message.to || binding?.lastInboundFrom)
+        const contextToken = normalizeText(message.contextToken || binding?.lastInboundContextToken)
+        if (!contextToken) {
+          throw new Error('wechat_context_token_missing')
+        }
+        const lastInboundAt = Number(binding?.lastInboundAt || 0)
+        if (lastInboundAt > 0 && Date.now() - lastInboundAt > WECHAT_CONTEXT_TOKEN_MAX_AGE_MS) {
+          throw new Error('wechat_context_token_expired')
+        }
+        const normalizedMessageType = normalizeText(message.type)
+        const sendResult = (normalizedMessageType === 'image' || normalizedMessageType === 'sticker')
+          ? await sendWechatIlinkMediaMessage({
+            env,
+            bindingId: freshBindingId || bindingId,
+            threadMeta: binding || message,
+            message: {
+              to: targetTo,
+              content: message.content,
+              caption: message.caption,
+              mediaUrl: message.mediaUrl,
+              mediaMime: message.mediaMime,
+              type: message.type,
+              contextToken
             }
-            await sendOutboxTypingStatus(binding, 1)
-            await sleep(waitMs)
-          }
-          const message = await outboxStore.claimMessage(pendingMessage.id, {
-            now: Date.now(),
-            leaseMs: DEFAULT_OUTBOX_SEND_LEASE_MS
           })
-          if (!message?.id) continue
-          claimedMessage = message
-          const targetTo = normalizeText(message.to || binding?.lastInboundFrom)
-          const contextToken = normalizeText(message.contextToken || binding?.lastInboundContextToken)
-          if (!contextToken) {
-            throw new Error('wechat_context_token_missing')
-          }
-          const lastInboundAt = Number(binding?.lastInboundAt || 0)
-          if (lastInboundAt > 0 && Date.now() - lastInboundAt > WECHAT_CONTEXT_TOKEN_MAX_AGE_MS) {
-            throw new Error('wechat_context_token_expired')
-          }
-          const sendResult = normalizeText(message.type) === 'image'
-            ? await sendWechatIlinkMediaMessage({
-              env,
-              bindingId,
-              threadMeta: binding || message,
-              message: {
-                to: targetTo,
-                content: message.content,
-                caption: message.caption,
-                mediaUrl: message.mediaUrl,
-                mediaMime: message.mediaMime,
-                type: message.type,
-                contextToken
-              }
-            })
-            : await sendWechatIlinkTextMessage({
-              env,
-              bindingId,
-              threadMeta: binding || message,
-              message: {
-                to: targetTo,
-                content: message.content,
-                contextToken
-              }
-            })
-          const sentAt = Date.now()
-          await outboxStore.patchMessage(message.id, {
-            status: 'sent',
-            messageId: normalizeText(sendResult?.messageId),
-            sentAt,
-            lastError: '',
-            attemptCount: Number(message.attemptCount || 0) + 1
+          : await sendWechatIlinkTextMessage({
+            env,
+            bindingId: freshBindingId || bindingId,
+            threadMeta: binding || message,
+            message: {
+              to: targetTo,
+              content: message.content,
+              contextToken
+            }
           })
-          await sendOutboxTypingStatus(binding, 2)
-          if (threadKey) latestSentAtByThread.set(threadKey, sentAt)
-        } catch (error) {
-          const nextAttemptCount = Number(claimedMessage.attemptCount || 0) + 1
-          await outboxStore.patchMessage(claimedMessage.id, {
-            status: nextAttemptCount >= 5 ? 'failed' : 'pending',
-            lastError: normalizeText(error?.message || error),
-            attemptCount: nextAttemptCount,
-            nextAttemptAt: Date.now() + Math.min(5, nextAttemptCount) * 60 * 1000
-          })
-        }
+        const sentAt = Date.now()
+        await outboxStore.patchMessage(message.id, {
+          status: 'sent',
+          messageId: normalizeText(sendResult?.messageId),
+          sentAt,
+          lastError: '',
+          attemptCount: Number(message.attemptCount || 0) + 1
+        })
+        await sendOutboxTypingStatus(binding, 2)
+        if (activeThreadKey) latestSentAtByThread.set(activeThreadKey, sentAt)
+      } catch (error) {
+        const nextAttemptCount = Number(claimedMessage.attemptCount || 0) + 1
+        await outboxStore.patchMessage(claimedMessage.id, {
+          status: nextAttemptCount >= 5 ? 'failed' : 'pending',
+          lastError: normalizeText(error?.message || error),
+          attemptCount: nextAttemptCount,
+          nextAttemptAt: Date.now() + Math.min(5, nextAttemptCount) * 60 * 1000
+        })
       }
+    }
+    return {
+      readyAutoReplyCount,
+      processedAutoReplyCount
+    }
+  }
+
+  const tick = async ({
+    syncBindings: shouldSyncBindings = true,
+    inlineQuietWaitMs: inlineQuietWaitMsOverride
+  } = {}) => {
+    if (state.tickInFlight) return
+    state.tickInFlight = true
+    state.lastTickAt = Date.now()
+    try {
+      let syncedThreadCount = 0
+      let updateCount = 0
+      if (shouldSyncBindings) {
+        const syncResult = await syncBindings()
+        syncedThreadCount = Number(syncResult?.syncedThreadCount || 0)
+        updateCount = Number(syncResult?.updateCount || 0)
+      }
+      const processResult = await processPendingWork({ inlineQuietWaitMsOverride })
       state.lastSyncedThreadCount = syncedThreadCount
       state.lastUpdateCount = updateCount
-      state.lastReadyAutoReplyCount = readyAutoReplyCount
-      state.lastProcessedAutoReplyCount = processedAutoReplyCount
+      state.lastReadyAutoReplyCount = Number(processResult?.readyAutoReplyCount || 0)
+      state.lastProcessedAutoReplyCount = Number(processResult?.processedAutoReplyCount || 0)
       state.lastError = ''
     } catch (error) {
       state.lastError = normalizeText(error?.message || error)

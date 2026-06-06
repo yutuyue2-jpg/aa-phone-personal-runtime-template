@@ -11,33 +11,10 @@ const json = (res, payload, status = 200) => {
 const normalizeText = (value = '') => String(value || '').trim()
 const HOSTED_WECHAT_BACKGROUND_WORKER_URL = 'https://ai-phone-background.yutuyue2.workers.dev'
 
-const POST_ROUTE_DAEMON_TICK_PATHS = new Set([
-  '/wechat/login/status',
-  '/wechat/sync-now',
-  '/wechat/outbox/enqueue',
-  '/wechat/thread-context',
-  '/wechat/config'
-])
-
-const isWechatDaemonEnabled = (env = {}) => ['1', 'true'].includes(
-  normalizeText(env?.WECHAT_DAEMON_ENABLED).toLowerCase()
-)
-
 const createWechatDaemonRuntimeForBridge = (env = {}) => createWechatDaemonRuntime({
   ...env,
   __WECHAT_DAEMON_AUTO_REPLY_HANDLER__: createWechatDaemonAutoReplyHandler(env)
 })
-
-const schedulePostRouteDaemonTick = (env = {}, routePath = '') => {
-  if (!isWechatDaemonEnabled(env)) return
-  if (!POST_ROUTE_DAEMON_TICK_PATHS.has(String(routePath || '').trim())) return
-  void createWechatDaemonRuntimeForBridge(env).tick().catch((error) => {
-    console.warn('[wechat-bridge-proxy] post-route daemon tick failed', {
-      routePath,
-      error
-    })
-  })
-}
 
 const normalizeUpstreamUrl = (value = '') => normalizeText(value).replace(/\/+$/, '')
 
@@ -87,7 +64,6 @@ export async function handleWechatBridgeProxy(req, res, env = {}, routePath = ''
   const targetUrl = buildUpstreamTarget(env, routePath, req?.url)
   if (!targetUrl) {
     await handleWechatIlinkBridge(req, res, env, routePath)
-    schedulePostRouteDaemonTick(env, routePath)
     return
   }
 
@@ -104,7 +80,6 @@ export async function handleWechatBridgeProxy(req, res, env = {}, routePath = ''
     res.statusCode = response.status
     res.setHeader('Content-Type', response.headers.get('content-type') || 'application/json; charset=utf-8')
     res.end(text)
-    schedulePostRouteDaemonTick(env, routePath)
   } catch (error) {
     json(res, {
       ok: false,

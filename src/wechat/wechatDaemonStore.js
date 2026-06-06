@@ -74,6 +74,11 @@ const mergeInboundUpdates = (existing = [], incoming = []) => {
 const mergeRecentInboundUpdates = (existing = [], incoming = []) => mergeInboundUpdates(existing, incoming)
   .slice(-RECENT_INBOUND_UPDATE_LIMIT)
 
+const buildInboundUpdateKey = (update = {}) => {
+  const normalized = normalizeInboundUpdate(update)
+  return normalized.id || `${normalized.from}:${normalized.createdAt}:${normalized.content}`
+}
+
 const resolveAutoReplyStateFromPending = ({
   pendingCount = 0,
   quietSeconds = 0,
@@ -89,11 +94,30 @@ const resolveAutoReplyStateFromPending = ({
 
 const clone = (value) => JSON.parse(JSON.stringify(value))
 
+const normalizeDeletedMessageIds = (ids = []) => Array.from(new Set(
+  (Array.isArray(ids) ? ids : [ids])
+    .map((item) => normalizeText(item))
+    .filter(Boolean)
+)).slice(-400)
+
+const normalizeThreadContextRole = (role = '') => {
+  const safeRole = normalizeText(role).toLowerCase()
+  if (['ai', 'assistant', 'bot', 'role', 'companion'].includes(safeRole)) return 'assistant'
+  if (['user', 'human', 'me'].includes(safeRole)) return 'user'
+  return safeRole
+}
+
+const normalizeThreadContextId = (id = '') => {
+  const safeId = normalizeText(id)
+  const wechatIdMatch = safeId.match(/^wechat_(\d+)$/)
+  return wechatIdMatch ? wechatIdMatch[1] : safeId
+}
+
 const normalizeThreadContextMessage = (message = {}) => {
   const safe = message && typeof message === 'object' ? message : {}
   return {
-    id: normalizeText(safe.id),
-    role: normalizeText(safe.role),
+    id: normalizeThreadContextId(safe.id),
+    role: normalizeThreadContextRole(safe.role),
     type: normalizeText(safe.type || 'text') || 'text',
     text: normalizeText(safe.text),
     originalText: normalizeText(safe.originalText),
@@ -110,11 +134,13 @@ const normalizeThreadContextMessage = (message = {}) => {
   }
 }
 
-const buildThreadContextMessageKey = (message = {}) => [
-  normalizeText(message?.id),
-  normalizeText(message?.role),
-  normalizeText(message?.type),
-  normalizeText(
+const buildThreadContextMessageKey = (message = {}) => {
+  const id = normalizeThreadContextId(message?.id)
+  if (id) return `id:${id}`
+  return [
+    normalizeThreadContextRole(message?.role),
+    normalizeText(message?.type),
+    normalizeText(
     message?.id
     || message?.originalText
     || message?.text
@@ -122,11 +148,44 @@ const buildThreadContextMessageKey = (message = {}) => [
     || message?.transcript
     || message?.description
     || message?.id
-  ),
-  Math.max(0, Number(message?.timestamp || 0)),
-  normalizeText(message?.amount),
-  normalizeText(message?.status)
-].join('|')
+    ),
+    Math.max(0, Number(message?.timestamp || 0)),
+    normalizeText(message?.amount),
+    normalizeText(message?.status)
+  ].join('|')
+}
+
+const buildUiThreadContextMessageKeys = (message = {}) => {
+  const id = normalizeText(message?.id)
+  const role = normalizeThreadContextRole(message?.role)
+  const roleVariants = Array.from(new Set([
+    normalizeText(message?.role),
+    role,
+    role === 'assistant' ? 'ai' : ''
+  ].filter(Boolean)))
+  return roleVariants.map((roleValue) => [
+    id,
+    roleValue,
+    normalizeText(message?.type || 'text') || 'text',
+    normalizeText(
+      message?.originalText
+      || message?.text
+      || message?.translatedText
+      || message?.transcript
+      || message?.description
+      || ''
+    ),
+    Math.max(0, Number(message?.timestamp || 0)),
+    normalizeText(message?.amount),
+    normalizeText(message?.status)
+  ].join('|'))
+}
+
+const buildThreadContextDeleteTokens = (message = {}) => normalizeDeletedMessageIds([
+  normalizeThreadContextId(message?.id),
+  `key:${buildThreadContextMessageKey(message)}`,
+  ...buildUiThreadContextMessageKeys(message).map((key) => `key:${key}`)
+])
 
 const mergeThreadContextMessages = (existing = [], incoming = []) => {
   const merged = []
@@ -143,6 +202,13 @@ const mergeThreadContextMessages = (existing = [], incoming = []) => {
   return merged
     .sort((left, right) => Number(left?.timestamp || 0) - Number(right?.timestamp || 0))
     .slice(-THREAD_CONTEXT_MESSAGE_LIMIT)
+}
+
+const filterDeletedThreadContextMessages = (messages = [], deletedMessageIds = []) => {
+  const deletedSet = new Set(normalizeDeletedMessageIds(deletedMessageIds))
+  const safeMessages = (Array.isArray(messages) ? messages : []).map((item) => normalizeThreadContextMessage(item))
+  if (!deletedSet.size) return safeMessages
+  return safeMessages.filter((message) => !buildThreadContextDeleteTokens(message).some((token) => deletedSet.has(token)))
 }
 
 const normalizeThreadContextEvent = (event = {}) => {
@@ -284,6 +350,7 @@ const normalizeThreadContextSettingsStore = (settings = {}) => {
 
 const normalizeThreadContextSnapshot = (snapshot = {}) => {
   const safe = snapshot && typeof snapshot === 'object' ? snapshot : {}
+  const deletedMessageIds = normalizeDeletedMessageIds(safe.deletedMessageIds)
   return {
     updatedAt: Math.max(0, Number(safe.updatedAt || Date.now())),
     backgroundDeviceId: normalizeText(safe.backgroundDeviceId || safe.deviceId),
@@ -296,9 +363,9 @@ const normalizeThreadContextSnapshot = (snapshot = {}) => {
       ? clone(safe.userInfo)
       : {},
     contact: normalizeThreadContextContact(safe.contact),
-    messages: Array.isArray(safe.messages)
-      ? safe.messages.map((item) => normalizeThreadContextMessage(item)).slice(-THREAD_CONTEXT_MESSAGE_LIMIT)
-      : [],
+    deletedMessageIds,
+    messages: filterDeletedThreadContextMessages(safe.messages, deletedMessageIds)
+      .slice(-THREAD_CONTEXT_MESSAGE_LIMIT),
     momentPosts: Array.isArray(safe.momentPosts)
       ? safe.momentPosts.map((item) => normalizeThreadContextMomentPost(item)).slice(0, THREAD_CONTEXT_MOMENT_LIMIT)
       : [],
@@ -784,8 +851,19 @@ export function createWechatDaemonStore(env = process.env) {
     const normalizedMeta = normalizeWechatDaemonThreadMeta(threadMeta)
     if (!normalizedMeta.threadKey) return null
     const existing = await getBindingByThreadKey(normalizedMeta.threadKey)
-    const mergedUpdates = mergeInboundUpdates(existing?.pendingInboundUpdates || [], updates)
-    const recentInboundUpdates = mergeRecentInboundUpdates(existing?.recentInboundUpdates || [], updates)
+    const seenInboundKeys = new Set([
+      ...(Array.isArray(existing?.recentInboundUpdates) ? existing.recentInboundUpdates : []),
+      ...(Array.isArray(existing?.pendingInboundUpdates) ? existing.pendingInboundUpdates : []),
+      ...(Array.isArray(existing?.processingInboundUpdates) ? existing.processingInboundUpdates : [])
+    ].map((item) => buildInboundUpdateKey(item)).filter(Boolean))
+    const freshUpdates = normalizeInboundUpdates(updates).filter((item) => {
+      const key = buildInboundUpdateKey(item)
+      if (!key || seenInboundKeys.has(key)) return false
+      seenInboundKeys.add(key)
+      return true
+    })
+    const mergedUpdates = mergeInboundUpdates(existing?.pendingInboundUpdates || [], freshUpdates)
+    const recentInboundUpdates = mergeRecentInboundUpdates(existing?.recentInboundUpdates || [], freshUpdates)
     const now = Date.now()
     const quietSeconds = normalizedMeta.quietSeconds
     const latestInbound = [...mergedUpdates].reverse().find((item) => item.from || item.contextToken) || null
@@ -817,7 +895,10 @@ export function createWechatDaemonStore(env = process.env) {
     const existing = await getBindingByThreadKey(threadKey)
     if (!existing?.threadKey) return null
     const currentSnapshot = normalizeThreadContextSnapshot(existing.threadContextSnapshot)
-    const mergedMessages = mergeThreadContextMessages(currentSnapshot.messages, messages)
+    const mergedMessages = filterDeletedThreadContextMessages(
+      mergeThreadContextMessages(currentSnapshot.messages, messages),
+      currentSnapshot.deletedMessageIds
+    )
     const nextUpdatedAt = Math.max(
       0,
       Number(options?.updatedAt || Date.now())

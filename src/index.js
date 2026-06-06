@@ -24,6 +24,13 @@ import { handleWechatBridgeProxy } from './wechat/wechatBridgeProxy.js'
 import { createWechatDaemonAutoReplyHandler } from './wechat/wechatDaemonAutoReplyHandler.js'
 import { createWechatDaemonRuntime } from './wechat/wechatDaemonRuntime.js'
 import {
+  ensureWechatDaemonLongPollOwner,
+  hasWechatDaemonLongPollOwner,
+  getWechatDaemonLongPollOwnerStatus,
+  isWechatDaemonLongPollOwnerHealthy,
+  WechatDaemonLongPollOwner
+} from './wechat/wechatDaemonLongPollOwner.js'
+import {
   buildWechatDaemonThreadKey,
   getWechatDaemonStore
 } from './wechat/wechatDaemonStore.js'
@@ -50,6 +57,7 @@ const MAX_INTERNAL_CHAT_MESSAGES = 64
 const VAPID_SETTING_KEY = 'vapid:keypair'
 const ENCRYPTED_PAYLOAD_VERSION = 1
 const RECENT_WECHAT_DAEMON_SUPPRESS_MS = 15 * 60 * 1000
+const WECHAT_CONTEXT_TOKEN_MAX_AGE_MS = 23 * 60 * 60 * 1000
 
 const json = (payload = {}, init = {}) => new Response(JSON.stringify(payload), {
   status: init.status || 200,
@@ -297,11 +305,33 @@ const arrayBufferToBase64Url = (buffer) => {
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
 }
 
+const base64UrlToUint8Array = (value = '') => {
+  const text = String(value || '').trim().replace(/-/g, '+').replace(/_/g, '/')
+  const padded = `${text}${'='.repeat((4 - (text.length % 4)) % 4)}`
+  const binary = atob(padded)
+  return Uint8Array.from(binary, (char) => char.charCodeAt(0))
+}
+
+const isValidVapidPublicKey = (value = '') => {
+  try {
+    const bytes = base64UrlToUint8Array(value)
+    return bytes.length === 65 && bytes[0] === 4
+  } catch {
+    return false
+  }
+}
+
 const exportVapidKeyPair = async (keyPair) => {
   const publicJwk = await crypto.subtle.exportKey('jwk', keyPair.publicKey)
   const privateJwk = await crypto.subtle.exportKey('jwk', keyPair.privateKey)
+  const x = base64UrlToUint8Array(publicJwk.x)
+  const y = base64UrlToUint8Array(publicJwk.y)
+  const publicBytes = new Uint8Array(65)
+  publicBytes[0] = 4
+  publicBytes.set(x, 1)
+  publicBytes.set(y, 33)
   return {
-    publicKey: `B${publicJwk.x}${publicJwk.y}`,
+    publicKey: arrayBufferToBase64Url(publicBytes),
     privateKey: privateJwk.d,
     createdAt: nowMs()
   }
@@ -309,7 +339,7 @@ const exportVapidKeyPair = async (keyPair) => {
 
 const getOrCreateVapidKeyPair = async (env) => {
   const existing = await getRuntimeSetting(env, VAPID_SETTING_KEY, null)
-  if (existing?.publicKey && existing?.privateKey) return existing
+  if (existing?.publicKey && existing?.privateKey && isValidVapidPublicKey(existing.publicKey)) return existing
   const keyPair = await crypto.subtle.generateKey(
     { name: 'ECDSA', namedCurve: 'P-256' },
     true,
@@ -420,6 +450,65 @@ const buildWechatOutboxThreadMeta = (role = null, thread = null) => {
   }
 }
 
+const resolveDeliverableWechatThreadBinding = async (env, role = null, now = Date.now()) => {
+  const thread = getBoundWechatThreadForRole(role)
+  if (!thread) {
+    return {
+      thread: null,
+      threadMeta: null,
+      binding: null,
+      reason: 'missing_bound_wechat_thread'
+    }
+  }
+  const threadMeta = buildWechatOutboxThreadMeta(role, thread)
+  if (!threadMeta.roleId || !threadMeta.chatId) {
+    return {
+      thread,
+      threadMeta,
+      binding: null,
+      reason: 'missing_wechat_thread_meta'
+    }
+  }
+  const runtime = createWechatDaemonRuntimeForWorker(env)
+  const threadKey = buildWechatDaemonThreadKey(threadMeta)
+  const binding = await runtime.store.getBindingByThreadKey(threadKey).catch(() => null)
+  if (!binding) {
+    return {
+      thread,
+      threadMeta,
+      binding: null,
+      reason: 'missing_daemon_binding'
+    }
+  }
+  const bindingId = trimText(binding?.bindingId || binding?.remoteBindingId)
+  const remoteBindingId = trimText(binding?.remoteBindingId || binding?.bindingId)
+  const to = trimText(binding?.lastInboundFrom)
+  const contextToken = trimText(binding?.lastInboundContextToken)
+  const lastInboundAt = Math.max(0, Number(binding?.lastInboundAt || 0))
+  if (!bindingId) {
+    return { thread, threadMeta, binding, reason: 'missing_binding_id' }
+  }
+  if (!to) {
+    return { thread, threadMeta, binding, reason: 'missing_last_inbound_from' }
+  }
+  if (!contextToken) {
+    return { thread, threadMeta, binding, reason: 'missing_context_token' }
+  }
+  if (lastInboundAt > 0 && now - lastInboundAt > WECHAT_CONTEXT_TOKEN_MAX_AGE_MS) {
+    return { thread, threadMeta, binding, reason: 'wechat_context_token_expired' }
+  }
+  return {
+    thread,
+    threadMeta,
+    binding,
+    bindingId,
+    remoteBindingId,
+    to,
+    contextToken,
+    reason: ''
+  }
+}
+
 const shouldSuppressBackgroundProactiveForWechatThread = async (env, role = null, now = Date.now()) => {
   const thread = getBoundWechatThreadForRole(role)
   if (!thread) return { suppress: false, reason: '' }
@@ -491,7 +580,7 @@ const buildRenderableWechatItems = (rawText = '', role = {}) => {
       const stickerName = trimText(stickerMatch[1], 120)
       const mediaUrl = resolveStickerMediaUrl(role, stickerName)
       items.push(mediaUrl
-        ? { type: 'image', content: line, caption: line, mediaUrl }
+        ? { type: 'sticker', content: line, caption: '', mediaUrl }
         : { type: 'text', content: line })
       continue
     }
@@ -500,7 +589,7 @@ const buildRenderableWechatItems = (rawText = '', role = {}) => {
     if (imageMatch) {
       const mediaUrl = trimText(imageMatch[1], 1000)
       items.push(isWechatMediaUrl(mediaUrl)
-        ? { type: 'image', content: '[图片]', caption: '[图片]', mediaUrl }
+        ? { type: 'image', content: '[图片]', caption: '', mediaUrl }
         : { type: 'text', content: line })
       continue
     }
@@ -561,8 +650,10 @@ const normalizeProactiveContextMessage = (message = {}, fallbackIndex = 0) => {
   const type = trimText(message?.type || 'text', 40) || 'text'
   const timestamp = Math.max(0, Number(message?.timestamp || message?.createdAt || message?.time || 0)) || fallbackIndex
   if (!text && type !== 'image') return null
+  const rawId = trimText(message?.id || message?.messageId || message?.externalWechatMessageId || '', 180)
+  const wechatIdMatch = rawId.match(/^wechat_(\d+)$/)
   return {
-    id: trimText(message?.id || message?.messageId || message?.externalWechatMessageId || '', 180),
+    id: wechatIdMatch ? wechatIdMatch[1] : rawId,
     role: normalizedRole === 'assistant' ? 'ai' : normalizedRole,
     type,
     text: text || (type === 'image' ? '[图片]' : ''),
@@ -874,6 +965,7 @@ const getWechatRoutePath = (pathname = '') => {
 const handleWechatDaemonRequest = async (request, env, routePath) => {
   const runtime = createWechatDaemonRuntimeForWorker(env)
   if (routePath === '/wechat/daemon/health') return json(await runtime.getStatus())
+  if (routePath === '/wechat/daemon/long-poll/status') return json(await getWechatDaemonLongPollOwnerStatus(env))
   if (routePath === '/wechat/daemon/threads') return json({ ok: true, bindings: await runtime.store.listBindings() })
   if (routePath === '/wechat/daemon/outbox') return json({ ok: true, messages: await runtime.outboxStore.listMessages() })
   if (routePath === '/wechat/daemon/tick') {
@@ -896,33 +988,40 @@ const handleWechatRequest = async (request, env, ctx = null) => {
   const response = await runNodeStyleHandler(request, (req, res) =>
     handleWechatBridgeProxy(req, res, env, routePath)
   )
-  if (
-    ['/wechat/sync-now', '/wechat/outbox/enqueue', '/wechat/thread-context', '/wechat/config'].includes(routePath)
-  ) {
-    const tickPromise = createWechatDaemonRuntimeForWorker(env).tick().catch((error) => {
-      console.warn('[personal-runtime] post-route wechat daemon tick failed', {
+  if (['/wechat/login/status', '/wechat/sync-now', '/wechat/outbox/enqueue', '/wechat/thread-context', '/wechat/config'].includes(routePath)) {
+    await ensureWechatDaemonLongPollOwner(env, ctx).catch((error) => {
+      console.warn('[personal-runtime] ensure wechat long-poll owner failed', {
         routePath,
         error
       })
     })
-    if (ctx?.waitUntil) {
-      ctx.waitUntil(tickPromise)
-      if (routePath === '/wechat/outbox/enqueue' || routePath === '/wechat/sync-now') {
-        await tickPromise
-      }
-    } else {
-      await tickPromise
-    }
+  }
+  if (['/wechat/sync-now', '/wechat/outbox/enqueue'].includes(routePath)) {
+    const tickPromise = createWechatDaemonRuntimeForWorker(env).tick({
+      syncBindings: !hasWechatDaemonLongPollOwner(env),
+      inlineQuietWaitMs: 0
+    }).catch((error) => {
+      console.warn('[personal-runtime] post-route wechat daemon drain failed', {
+        routePath,
+        error
+      })
+    })
+    if (ctx?.waitUntil) ctx.waitUntil(tickPromise)
+    await tickPromise
   }
   return response
 }
 
-const enqueueWechatOutboxForProactiveMessage = async (env, role = null, pendingMessage = {}) => {
-  const thread = getBoundWechatThreadForRole(role)
-  if (!thread) return { enqueued: false, reason: 'missing_bound_wechat_thread' }
-  const threadMeta = buildWechatOutboxThreadMeta(role, thread)
-  if (!threadMeta.roleId || !threadMeta.chatId) {
-    return { enqueued: false, reason: 'missing_wechat_thread_meta' }
+const enqueueWechatOutboxForProactiveMessage = async (env, role = null, pendingMessage = {}, deliverableBinding = null) => {
+  const resolvedBinding = deliverableBinding?.threadMeta
+    ? deliverableBinding
+    : await resolveDeliverableWechatThreadBinding(env, role)
+  const threadMeta = resolvedBinding?.threadMeta
+  if (!threadMeta?.roleId || !threadMeta?.chatId) {
+    return { enqueued: false, reason: resolvedBinding?.reason || 'missing_wechat_thread_meta' }
+  }
+  if (resolvedBinding?.reason) {
+    return { enqueued: false, reason: resolvedBinding.reason, threadMeta }
   }
   const content = String(pendingMessage.rawText || pendingMessage.body || '').trim()
   if (!content) return { enqueued: false, reason: 'empty_content' }
@@ -937,39 +1036,51 @@ const enqueueWechatOutboxForProactiveMessage = async (env, role = null, pendingM
   for (let index = 0; index < outboxItems.length; index += 1) {
     const item = outboxItems[index] && typeof outboxItems[index] === 'object' ? outboxItems[index] : {}
     const itemContent = String(item.content || '').trim()
-    if (!itemContent) continue
+    if (!itemContent && String(item.type || '').trim() !== 'image' && String(item.type || '').trim() !== 'sticker') continue
     const queued = await runtime.outboxStore.enqueueMessage({
       threadMeta,
       source: 'background_proactive',
-      type: item.type === 'image' ? 'image' : 'text',
+      type: item.type === 'sticker' ? 'sticker' : (item.type === 'image' ? 'image' : 'text'),
       content: itemContent,
       caption: String(item.caption || '').trim(),
       mediaUrl: String(item.mediaUrl || '').trim(),
+      bindingId: resolvedBinding.bindingId,
+      remoteBindingId: resolvedBinding.remoteBindingId,
+      to: resolvedBinding.to,
+      contextToken: resolvedBinding.contextToken,
       messageId,
       idempotencyKey: `${idempotencyKey}:${index}`
     })
     if (queued?.id) queuedMessages.push(queued)
   }
   const baseTimestamp = Number(pendingMessage.createdAt || Date.now())
-  await runtime.store.appendThreadContextMessages(queuedMessages[0]?.threadKey || threadMeta.threadKey, outboxItems.map((item, index) => ({
-    id: `${messageId}_${index}`,
-    role: 'assistant',
-    type: item.type === 'image' ? 'image' : 'text',
-    text: String(item.content || '').trim(),
-    originalText: index === 0 ? content : String(item.content || '').trim(),
-    url: String(item.mediaUrl || '').trim(),
-    mediaUrl: String(item.mediaUrl || '').trim(),
-    timestamp: baseTimestamp + index,
-    source: 'background_proactive'
-  })), {
-    updatedAt: Number(pendingMessage.createdAt || Date.now())
-  }).catch((error) => {
-    console.warn('[personal-runtime] append proactive wechat thread context failed', {
-      messageId,
-      error
+  if (queuedMessages.length) {
+    await runtime.store.appendThreadContextMessages(queuedMessages[0]?.threadKey || threadMeta.threadKey, outboxItems.map((item, index) => ({
+      id: `${messageId}_${index}`,
+      role: 'assistant',
+      type: item.type === 'sticker' ? 'sticker' : (item.type === 'image' ? 'image' : 'text'),
+      text: String(item.content || '').trim(),
+      originalText: index === 0 ? content : String(item.content || '').trim(),
+      url: String(item.mediaUrl || '').trim(),
+      mediaUrl: String(item.mediaUrl || '').trim(),
+      timestamp: baseTimestamp + index,
+      source: 'background_proactive'
+    })), {
+      updatedAt: Number(pendingMessage.createdAt || Date.now())
+    }).catch((error) => {
+      console.warn('[personal-runtime] append proactive wechat thread context failed', {
+        messageId,
+        error
+      })
     })
-  })
-  const tickResult = await runtime.tick().catch((error) => ({
+  }
+  const ownerEnsureResult = queuedMessages.length
+    ? await ensureWechatDaemonLongPollOwner(env).catch((error) => ({
+      ok: false,
+      error: String(error?.message || error || '')
+    }))
+    : null
+  const tickResult = await runtime.tick({ syncBindings: false, inlineQuietWaitMs: 0 }).catch((error) => ({
     ok: false,
     error: String(error?.message || error || '')
   }))
@@ -978,6 +1089,7 @@ const enqueueWechatOutboxForProactiveMessage = async (env, role = null, pendingM
     outboxMessageId: queuedMessages[0]?.id || '',
     outboxMessageIds: queuedMessages.map((item) => item.id).filter(Boolean),
     threadMeta,
+    ownerEnsureResult,
     tickResult
   }
 }
@@ -1255,13 +1367,30 @@ const runDevice = async (env, deviceId, { force = false } = {}) => {
     })
     return { generated: false, reason: wechatSuppression.reason || 'wechat_daemon_suppressed' }
   }
+  const deliverableWechatBinding = roleHasBoundWechatBridge(role)
+    ? await resolveDeliverableWechatThreadBinding(env, role, now).catch((error) => ({
+      thread: null,
+      threadMeta: null,
+      binding: null,
+      reason: String(error?.message || error || 'resolve_deliverable_wechat_binding_failed')
+    }))
+    : null
+  if (roleHasBoundWechatBridge(role) && deliverableWechatBinding?.reason) {
+    await putBackgroundState(env, deviceId, {
+      ...state,
+      nextCheckAt,
+      lastCheckedAt: now,
+      lastSkipReason: deliverableWechatBinding.reason
+    })
+    return { generated: false, reason: deliverableWechatBinding.reason }
+  }
 
   const messages = buildRequestMessagesForRole(snapshot, role, pendingMessages)
   const rawText = await callBackgroundModel({ keyConfig, messages })
   if (!rawText) return { generated: false, reason: 'empty_model_reply' }
 
   const pendingMessage = buildMessageForRole({ role, rawText })
-  const wechatOutboxResult = await enqueueWechatOutboxForProactiveMessage(env, role, pendingMessage).catch((error) => ({
+  const wechatOutboxResult = await enqueueWechatOutboxForProactiveMessage(env, role, pendingMessage, deliverableWechatBinding).catch((error) => ({
     enqueued: false,
     reason: 'wechat_outbox_enqueue_failed',
     error: String(error?.message || error || '')
@@ -1489,9 +1618,22 @@ export default {
   async scheduled(_event, env, ctx) {
     ctx.waitUntil((async () => {
       assertDb(env)
-      await createWechatDaemonRuntimeForWorker(env).tick().catch((error) => {
-        console.warn('[personal-runtime] scheduled wechat daemon tick failed', error)
+      await ensureWechatDaemonLongPollOwner(env, ctx).catch((error) => {
+        console.warn('[personal-runtime] scheduled ensure wechat long-poll owner failed', error)
       })
+      const longPollHealth = await isWechatDaemonLongPollOwnerHealthy(env).catch((error) => ({
+        healthy: false,
+        error: String(error?.message || error || '')
+      }))
+      const drainWechatDaemon = async (label = 'wechat daemon drain') => {
+        await createWechatDaemonRuntimeForWorker(env).tick({
+          syncBindings: !longPollHealth?.healthy,
+          inlineQuietWaitMs: 0
+        }).catch((error) => {
+          console.warn(`[personal-runtime] scheduled ${label} failed`, error)
+        })
+      }
+      await drainWechatDaemon('pre-background')
       const devices = await listBackgroundDeviceIds(env, MAX_DEVICES_PER_CRON)
       const maxGenerations = Number(env.MAX_GENERATIONS_PER_CRON || DEFAULT_MAX_GENERATIONS_PER_CRON)
       let generatedCount = 0
@@ -1510,9 +1652,9 @@ export default {
           })
         }
       }
-      await createWechatDaemonRuntimeForWorker(env).tick().catch((error) => {
-        console.warn('[personal-runtime] scheduled post-background wechat daemon tick failed', error)
-      })
+      await drainWechatDaemon('post-background')
     })())
   }
 }
+
+export { WechatDaemonLongPollOwner }

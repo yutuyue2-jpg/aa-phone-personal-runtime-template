@@ -61,13 +61,54 @@ const getThreadContextMessageText = (message = {}) => normalizeText(
     || message?.content
 )
 
-const buildThreadContextMessageKey = (message = {}) => [
-  normalizeText(message?.id),
-  normalizeText(message?.role),
-  normalizeText(message?.type || 'text') || 'text',
-  getThreadContextMessageText(message),
-  Math.max(0, Number(message?.timestamp || message?.createdAt || 0))
-].join('|')
+const normalizeThreadContextRole = (role = '') => {
+  const safeRole = normalizeText(role).toLowerCase()
+  if (['ai', 'assistant', 'bot', 'role', 'companion'].includes(safeRole)) return 'assistant'
+  if (['user', 'human', 'me'].includes(safeRole)) return 'user'
+  return safeRole
+}
+
+const normalizeThreadContextId = (id = '') => {
+  const safeId = normalizeText(id)
+  const wechatIdMatch = safeId.match(/^wechat_(\d+)$/)
+  return wechatIdMatch ? wechatIdMatch[1] : safeId
+}
+
+const buildThreadContextMessageKey = (message = {}) => {
+  const id = normalizeThreadContextId(message?.id)
+  if (id) return `id:${id}`
+  return [
+    normalizeThreadContextRole(message?.role),
+    normalizeText(message?.type || 'text') || 'text',
+    getThreadContextMessageText(message),
+    Math.max(0, Number(message?.timestamp || message?.createdAt || 0))
+  ].join('|')
+}
+
+const buildUiThreadContextMessageKeys = (message = {}) => {
+  const id = normalizeText(message?.id)
+  const role = normalizeThreadContextRole(message?.role)
+  const roleVariants = Array.from(new Set([
+    normalizeText(message?.role),
+    role,
+    role === 'assistant' ? 'ai' : ''
+  ].filter(Boolean)))
+  return roleVariants.map((roleValue) => [
+    id,
+    roleValue,
+    normalizeText(message?.type || 'text') || 'text',
+    getThreadContextMessageText(message),
+    Math.max(0, Number(message?.timestamp || message?.createdAt || 0)),
+    normalizeText(message?.amount),
+    normalizeText(message?.status)
+  ].join('|'))
+}
+
+const buildThreadContextDeleteTokens = (message = {}) => normalizeDeletedMessageIds([
+  normalizeThreadContextId(message?.id),
+  `key:${buildThreadContextMessageKey(message)}`,
+  ...buildUiThreadContextMessageKeys(message).map((key) => `key:${key}`)
+])
 
 const mergeThreadContextMessages = (existing = [], incoming = [], limit = 80) => {
   const seen = new Set()
@@ -88,9 +129,36 @@ const mergeThreadContextMessages = (existing = [], incoming = [], limit = 80) =>
     .slice(-Math.max(1, Number(limit || 80)))
 }
 
+const normalizeDeletedMessageIds = (ids = []) => Array.from(new Set(
+  (Array.isArray(ids) ? ids : [ids])
+    .map((item) => normalizeText(item))
+    .filter(Boolean)
+)).slice(-400)
+
+const filterDeletedThreadContextMessages = (messages = [], deletedMessageIds = []) => {
+  const deletedSet = new Set(normalizeDeletedMessageIds(deletedMessageIds))
+  const safeMessages = (Array.isArray(messages) ? messages : []).map((message) => cloneJson(message))
+  if (!deletedSet.size) return safeMessages
+  return safeMessages.filter((message) => !buildThreadContextDeleteTokens(message).some((token) => deletedSet.has(token)))
+}
+
+const filterDeletedInboundUpdates = (updates = [], deletedMessageIds = []) => {
+  const deletedSet = new Set(normalizeDeletedMessageIds(deletedMessageIds))
+  const safeUpdates = (Array.isArray(updates) ? updates : []).map((update) => cloneJson(update))
+  if (!deletedSet.size) return safeUpdates
+  return safeUpdates.filter((update) => {
+    const updateId = normalizeText(update?.id || update?.messageId || update?.msgId)
+    return !updateId || !deletedSet.has(updateId)
+  })
+}
+
 const mergeThreadContextSnapshots = (existing = null, incoming = null) => {
   const base = existing && typeof existing === 'object' ? existing : {}
   const next = incoming && typeof incoming === 'object' ? incoming : {}
+  const deletedMessageIds = normalizeDeletedMessageIds([
+    ...(Array.isArray(base?.deletedMessageIds) ? base.deletedMessageIds : []),
+    ...(Array.isArray(next?.deletedMessageIds) ? next.deletedMessageIds : [])
+  ])
   return {
     ...cloneJson(base),
     ...cloneJson(next),
@@ -100,18 +168,34 @@ const mergeThreadContextSnapshots = (existing = null, incoming = null) => {
       Number(next.updatedAt || 0),
       Date.now()
     ),
-    messages: mergeThreadContextMessages(base.messages, next.messages)
+    deletedMessageIds,
+    messages: filterDeletedThreadContextMessages(
+      mergeThreadContextMessages(base.messages, next.messages),
+      deletedMessageIds
+    )
   }
 }
 
-const listRecentThreadContextMessages = (binding = null, limit = 40) => {
-  const messages = Array.isArray(binding?.threadContextSnapshot?.messages)
-    ? binding.threadContextSnapshot.messages
-    : []
+const listRecentThreadContextMessages = (binding = null, limit = 80) => {
+  const messages = filterDeletedThreadContextMessages(
+    binding?.threadContextSnapshot?.messages,
+    binding?.threadContextSnapshot?.deletedMessageIds
+  )
   return messages
     .slice(-Math.max(1, Number(limit || 40)))
     .map((message) => cloneJson(message))
 }
+
+const filterInboundUpdatesSince = (updates = [], since = 0) => {
+  const safeSince = Math.max(0, Number(since || 0))
+  if (!(safeSince > 0)) return Array.isArray(updates) ? updates : []
+  return (Array.isArray(updates) ? updates : [])
+    .filter((update) => Number(update?.createdAt || 0) > safeSince)
+}
+
+const listSyncWindowThreadContextMessages = (messages = [], _since = 0) => (
+  Array.isArray(messages) ? messages : []
+)
 
 const resolveThreadMeta = (body = {}, state = {}) => {
   const bodyMeta = getThreadMetaFromInput(body?.threadMeta)
@@ -196,10 +280,11 @@ const appendOutboxMessageToThreadContext = async (env = {}, threadMeta = {}, out
   if (!normalizedThreadMeta.threadKey || !role || !content) return null
   const daemonStore = getWechatDaemonStoreSafe(env)
   if (!daemonStore || typeof daemonStore.appendThreadContextMessages !== 'function') return null
+  const outboxType = normalizeText(outboxMessage?.type)
   return daemonStore.appendThreadContextMessages(normalizedThreadMeta.threadKey, [{
     id: normalizeText(outboxMessage?.clientMessageId || outboxMessage?.id || outboxMessage?.messageId),
     role,
-    type: normalizeText(outboxMessage?.type) === 'image' ? 'image' : 'text',
+    type: outboxType === 'sticker' ? 'sticker' : (outboxType === 'image' ? 'image' : 'text'),
     text: content,
     originalText: content,
     url: normalizeText(outboxMessage?.mediaUrl),
@@ -624,6 +709,8 @@ const buildImageMessagePayload = (state = {}, input = {}, uploaded = {}) => {
   const to = normalizeText(input.to || input.openid || input.message?.to || input.message?.openid)
   const contextToken = normalizeText(input.contextToken || input.context_token || input.message?.contextToken)
     || normalizeText(state.contextByUser?.[to])
+  const aesKeyBase64 = Buffer.from(normalizeText(uploaded.aeskey)).toString('base64')
+  const encryptedSize = Number(uploaded.fileSizeCiphertext || 0) || 0
   return {
     msg: {
       from_user_id: '',
@@ -637,14 +724,26 @@ const buildImageMessagePayload = (state = {}, input = {}, uploaded = {}) => {
         image_item: {
           media: {
             encrypt_query_param: uploaded.downloadEncryptedQueryParam,
-            aes_key: Buffer.from(uploaded.aeskey, 'hex').toString('base64'),
+            aes_key: aesKeyBase64,
             encrypt_type: 1
           },
-          mid_size: uploaded.fileSizeCiphertext
+          aeskey: normalizeText(uploaded.aeskey),
+          mid_size: encryptedSize,
+          hd_size: encryptedSize
         }
       }]
     }
   }
+}
+
+const normalizeWechatMediaCaption = (message = {}) => {
+  if (normalizeText(message?.type) === 'sticker') return ''
+  const rawCaption = normalizeText(message?.caption || message?.content)
+  if (!rawCaption) return ''
+  if (/^\[(?:表情|sticker|image|图片)\s*[:：]?[^\]]*\]$/i.test(rawCaption)) return ''
+  if (/^发了一个表情(?:[:：].*)?$/i.test(rawCaption)) return ''
+  if (/^发来一张图片(?:[:：].*)?$/i.test(rawCaption)) return ''
+  return rawCaption
 }
 
 const buildTypingConfigPayload = (input = {}) => ({
@@ -793,7 +892,9 @@ const resolveWechatBindingAccess = async (env = {}, {
 export const syncWechatIlinkBinding = async ({
   env = {},
   bindingId = '',
-  threadMeta = null
+  threadMeta = null,
+  inboundSince = 0,
+  threadMessageSince = 0
 } = {}) => {
   const bindingAccess = await resolveWechatBindingAccess(env, { bindingId, threadMeta })
   const state = bindingAccess.state
@@ -853,10 +954,19 @@ export const syncWechatIlinkBinding = async ({
   const recentInboundUpdates = Array.isArray(latestBinding?.recentInboundUpdates)
     ? latestBinding.recentInboundUpdates
     : []
+  const deletedMessageIds = normalizeDeletedMessageIds(latestBinding?.threadContextSnapshot?.deletedMessageIds || [])
+  const recentThreadMessages = listRecentThreadContextMessages(latestBinding)
+  const visibleInboundUpdates = filterDeletedInboundUpdates(
+    recentInboundUpdates.length ? recentInboundUpdates : inboundUpdates,
+    deletedMessageIds
+  )
+  const incrementalInboundUpdates = filterInboundUpdatesSince(visibleInboundUpdates, inboundSince)
+  const incrementalThreadMessages = listSyncWindowThreadContextMessages(recentThreadMessages, threadMessageSince)
   return {
-    updates: inboundUpdates,
-    recentInboundUpdates: recentInboundUpdates.length ? recentInboundUpdates : inboundUpdates,
-    recentThreadMessages: listRecentThreadContextMessages(latestBinding),
+    updates: filterDeletedInboundUpdates(inboundUpdates, deletedMessageIds),
+    recentInboundUpdates: incrementalInboundUpdates,
+    recentThreadMessages: incrementalThreadMessages,
+    deletedMessageIds,
     bindingId: nextBindingId,
     remoteBindingId: nextBindingId,
     latestInboundAt
@@ -868,7 +978,9 @@ const handleSyncNow = async (req, res, env) => {
   const result = await syncWechatIlinkBinding({
     env,
     bindingId: body.bindingId,
-    threadMeta: body.threadMeta
+    threadMeta: body.threadMeta,
+    inboundSince: Number(body?.inboundSince || 0),
+    threadMessageSince: Number(body?.threadMessageSince || 0)
   })
   json(res, {
     ok: true,
@@ -878,6 +990,9 @@ const handleSyncNow = async (req, res, env) => {
       : [],
     recentThreadMessages: Array.isArray(result.recentThreadMessages)
       ? result.recentThreadMessages
+      : [],
+    deletedMessageIds: Array.isArray(result.deletedMessageIds)
+      ? result.deletedMessageIds
       : [],
     bindingId: result.bindingId,
     remoteBindingId: result.remoteBindingId,
@@ -920,7 +1035,7 @@ export const sendWechatIlinkTextMessage = async ({
   })
   return {
     ok: true,
-    messageId: normalizeText(result.msg_id || result.msgid || result.id),
+    messageId: normalizeText(result.msg_id || result.msgid || result.id || payload.msg.client_id),
     raw: result
   }
 }
@@ -941,7 +1056,8 @@ export const sendWechatIlinkMediaMessage = async ({
   let contextToken = normalizeText(safeMessage.contextToken || safeMessage.context_token)
     || normalizeText(state.contextByUser?.[to])
   const mediaUrl = normalizeText(safeMessage.mediaUrl || safeMessage.media_url)
-  const caption = normalizeText(safeMessage.caption || safeMessage.content)
+  const messageType = normalizeText(safeMessage.type || 'image')
+  const caption = normalizeWechatMediaCaption(safeMessage)
   if (!to) {
     const error = new Error('missing_wechat_media_target')
     error.status = 400
@@ -957,7 +1073,7 @@ export const sendWechatIlinkMediaMessage = async ({
     error.status = 400
     throw error
   }
-  if (caption) {
+  if (caption && messageType !== 'sticker') {
     await sendWechatIlinkTextMessage({
       env,
       bindingId: activeBindingId,
