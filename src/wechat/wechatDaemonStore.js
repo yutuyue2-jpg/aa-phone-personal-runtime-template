@@ -867,8 +867,10 @@ export function createWechatDaemonStore(env = process.env) {
     const now = Date.now()
     const quietSeconds = normalizedMeta.quietSeconds
     const latestInbound = [...mergedUpdates].reverse().find((item) => item.from || item.contextToken) || null
+    const latestInboundAt = Number(latestInbound?.createdAt || 0)
+    const quietBaseAt = latestInboundAt > 0 ? latestInboundAt : now
     const quietUntilAt = mergedUpdates.length
-      ? now + (Math.max(0, quietSeconds) * 1000)
+      ? quietBaseAt + (Math.max(0, quietSeconds) * 1000)
       : 0
     const autoReplyState = resolveAutoReplyStateFromPending({
       pendingCount: mergedUpdates.length,

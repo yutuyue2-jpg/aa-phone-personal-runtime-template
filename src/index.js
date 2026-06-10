@@ -997,10 +997,15 @@ const handleWechatRequest = async (request, env, ctx = null) => {
     })
   }
   if (['/wechat/sync-now', '/wechat/outbox/enqueue'].includes(routePath)) {
-    const tickPromise = createWechatDaemonRuntimeForWorker(env).tick({
-      syncBindings: !hasWechatDaemonLongPollOwner(env),
-      inlineQuietWaitMs: 0
-    }).catch((error) => {
+    const tickOptions = routePath === '/wechat/outbox/enqueue'
+      ? {
+          syncBindings: !hasWechatDaemonLongPollOwner(env),
+          inlineQuietWaitMs: 0
+        }
+      : {
+          syncBindings: !hasWechatDaemonLongPollOwner(env)
+        }
+    const tickPromise = createWechatDaemonRuntimeForWorker(env).tick(tickOptions).catch((error) => {
       console.warn('[personal-runtime] post-route wechat daemon drain failed', {
         routePath,
         error
@@ -1626,10 +1631,15 @@ export default {
         error: String(error?.message || error || '')
       }))
       const drainWechatDaemon = async (label = 'wechat daemon drain') => {
-        await createWechatDaemonRuntimeForWorker(env).tick({
-          syncBindings: !longPollHealth?.healthy,
-          inlineQuietWaitMs: 0
-        }).catch((error) => {
+        const tickOptions = longPollHealth?.healthy
+          ? {
+              syncBindings: false,
+              inlineQuietWaitMs: 0
+            }
+          : {
+              syncBindings: true
+            }
+        await createWechatDaemonRuntimeForWorker(env).tick(tickOptions).catch((error) => {
           console.warn(`[personal-runtime] scheduled ${label} failed`, error)
         })
       }
