@@ -2,12 +2,14 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { spawnSync } from 'node:child_process'
-import { createRequire } from 'node:module'
-
-const require = createRequire(import.meta.url)
 const projectRoot = path.resolve(import.meta.dirname, '..')
 const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm'
-const wranglerCli = require.resolve('wrangler/wrangler-dist/cli.js')
+const wranglerCommand = path.join(
+  projectRoot,
+  'node_modules',
+  '.bin',
+  process.platform === 'win32' ? 'wrangler.cmd' : 'wrangler'
+)
 
 const run = (label, command, args = [], options = {}) => {
   console.log(`[personal-runtime-deploy] ${label}`)
@@ -102,7 +104,7 @@ const printLatestWranglerLogDiagnostics = () => {
 try {
   run('apply D1 migrations', npmCommand, ['run', 'db:migrations:apply'])
   run('ensure runtime secrets', npmCommand, ['run', 'secrets:ensure'])
-  run('deploy worker with cron triggers', process.execPath, [wranglerCli, 'deploy'], {
+  run('deploy worker with cron triggers', wranglerCommand, ['deploy'], {
     env: {
       WRANGLER_LOG: 'debug',
       WRANGLER_LOG_SANITIZE: 'false'

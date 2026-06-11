@@ -1548,6 +1548,32 @@ export default {
         await requireOwner(request, env)
         return handleWechatRequest(request, env, ctx)
       }
+      if (request.method === 'GET' && url.pathname === '/image-proxy') {
+        const targetUrl = String(url.searchParams.get('url') || '').trim()
+        if (!targetUrl) return json({ ok: false, error: 'missing_url' }, { status: 400 })
+        try {
+          const targetResp = await fetch(targetUrl, {
+            headers: { 'User-Agent': 'AI-Phone-ImageProxy/1.0' },
+            redirect: 'follow'
+          })
+          if (!targetResp.ok) {
+            return json({ ok: false, error: 'upstream_error', status: targetResp.status }, { status: 502 })
+          }
+          const contentType = targetResp.headers.get('content-type') || 'image/png'
+          const body = await targetResp.arrayBuffer()
+          return new Response(body, {
+            status: 200,
+            headers: {
+              'content-type': contentType,
+              'access-control-allow-origin': '*',
+              'cache-control': 'public, max-age=86400',
+              'x-proxy-source': 'image-proxy'
+            }
+          })
+        } catch (proxyError) {
+          return json({ ok: false, error: 'proxy_fetch_failed', message: String(proxyError?.message || '') }, { status: 502 })
+        }
+      }
       if (request.method === 'GET' && url.pathname === '/cloud/health') return handleHealth(env)
       if (request.method === 'GET' && url.pathname === '/health') return handleHealth(env)
       if (request.method === 'POST' && url.pathname === '/setup/claim') return handleClaim(request, env)

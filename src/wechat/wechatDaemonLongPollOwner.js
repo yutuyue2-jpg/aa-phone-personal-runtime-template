@@ -4,8 +4,25 @@ import { createWechatDaemonRuntime } from './wechatDaemonRuntime.js'
 const OWNER_NAME = 'global'
 const CONTINUE_DELAY_MS = 800
 const ERROR_DELAY_MS = 2000
+const REMOTE_DEBUG_EVENT_URL = 'https://ai-phone-background.yutuyue2.workers.dev/debug/event'
 
 const normalizeText = (value = '') => String(value || '').trim()
+
+const reportDebugEvent = (location = '', msg = '', data = {}) => {
+  fetch(REMOTE_DEBUG_EVENT_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      sessionId: 'wechat-auto-reply',
+      runId: 'pre-fix',
+      hypothesisId: 'H1',
+      location,
+      msg,
+      data,
+      ts: Date.now()
+    })
+  }).catch(() => {})
+}
 
 const json = (payload = {}, status = 200) => new Response(JSON.stringify(payload), {
   status,
@@ -38,18 +55,46 @@ export class WechatDaemonLongPollOwner {
   }
 
   async fetch(request) {
-    const url = new URL(request.url)
-    if (url.pathname === '/status') {
-      return json(await this.getStatus())
+    try {
+      const url = new URL(request.url)
+      if (url.pathname === '/status') {
+        return json(await this.getStatus())
+      }
+      if (url.pathname === '/ensure') {
+        return json(await this.ensure())
+      }
+      return json({ ok: false, error: 'route_not_found' }, 404)
+    } catch (error) {
+      const safeError = normalizeText(error?.message || error)
+      // #region debug-point H1:owner-fetch-failed
+      reportDebugEvent('workers/personal-runtime/src/wechat/wechatDaemonLongPollOwner.js:fetch', '[DEBUG] long-poll owner fetch failed', {
+        error: safeError
+      })
+      // #endregion
+      return json({
+        ok: false,
+        owner: 'wechat-daemon-long-poll',
+        error: safeError || 'wechat_daemon_long_poll_fetch_failed'
+      }, 500)
     }
-    if (url.pathname === '/ensure') {
-      return json(await this.ensure())
-    }
-    return json({ ok: false, error: 'route_not_found' }, 404)
   }
 
   async alarm() {
-    await this.runLoop('alarm')
+    try {
+      await this.runLoop('alarm')
+    } catch (error) {
+      const safeError = normalizeText(error?.message || error)
+      // #region debug-point H1:owner-alarm-failed
+      reportDebugEvent('workers/personal-runtime/src/wechat/wechatDaemonLongPollOwner.js:alarm', '[DEBUG] long-poll owner alarm failed', {
+        error: safeError
+      })
+      // #endregion
+      await this.state.storage.put({
+        lastRunAt: Date.now(),
+        lastTrigger: 'alarm',
+        lastError: safeError
+      }).catch(() => null)
+    }
   }
 
   async ensure() {
@@ -59,6 +104,11 @@ export class WechatDaemonLongPollOwner {
     const runtime = createWechatDaemonRuntimeForOwner(this.env)
     const bindings = await runtime.store.listBindings().catch(() => [])
     const activeBindingCount = (Array.isArray(bindings) ? bindings : []).filter(isActiveBinding).length
+    // #region debug-point H1:owner-ensure
+    reportDebugEvent('workers/personal-runtime/src/wechat/wechatDaemonLongPollOwner.js:ensure', '[DEBUG] long-poll owner ensure', {
+      activeBindingCount
+    })
+    // #endregion
     await this.state.storage.put({
       lastEnsureAt: Date.now(),
       activeBindingCount
@@ -87,6 +137,12 @@ export class WechatDaemonLongPollOwner {
         const runtime = createWechatDaemonRuntimeForOwner(this.env)
         const beforeBindings = await runtime.store.listBindings().catch(() => [])
         activeBindingCount = (Array.isArray(beforeBindings) ? beforeBindings : []).filter(isActiveBinding).length
+        // #region debug-point H1:owner-runloop-start
+        reportDebugEvent('workers/personal-runtime/src/wechat/wechatDaemonLongPollOwner.js:runLoop:start', '[DEBUG] long-poll owner runLoop start', {
+          trigger,
+          activeBindingCount
+        })
+        // #endregion
         if (activeBindingCount <= 0) {
           await this.state.storage.put({
             lastRunAt: Date.now(),
@@ -103,6 +159,13 @@ export class WechatDaemonLongPollOwner {
         const afterBindings = await runtime.store.listBindings().catch(() => beforeBindings)
         activeBindingCount = (Array.isArray(afterBindings) ? afterBindings : []).filter(isActiveBinding).length
         nextDelayMs = activeBindingCount > 0 ? CONTINUE_DELAY_MS : 0
+        // #region debug-point H1:owner-runloop-success
+        reportDebugEvent('workers/personal-runtime/src/wechat/wechatDaemonLongPollOwner.js:runLoop:success', '[DEBUG] long-poll owner runLoop success', {
+          trigger,
+          activeBindingCount,
+          nextDelayMs
+        })
+        // #endregion
         await this.state.storage.put({
           lastRunAt: Date.now(),
           lastTrigger: trigger,
@@ -112,6 +175,14 @@ export class WechatDaemonLongPollOwner {
       } catch (error) {
         lastError = normalizeText(error?.message || error)
         nextDelayMs = ERROR_DELAY_MS
+        // #region debug-point H1:owner-runloop-failed
+        reportDebugEvent('workers/personal-runtime/src/wechat/wechatDaemonLongPollOwner.js:runLoop:failed', '[DEBUG] long-poll owner runLoop failed', {
+          trigger,
+          activeBindingCount,
+          nextDelayMs,
+          error: lastError
+        })
+        // #endregion
         await this.state.storage.put({
           lastRunAt: Date.now(),
           lastTrigger: trigger,
@@ -174,11 +245,23 @@ export const ensureWechatDaemonLongPollOwner = async (env = {}, ctx = null) => {
   if (!stub) return { ok: false, skipped: 'missing_long_poll_owner_binding' }
   const run = async () => {
     const response = await stub.fetch('https://wechat-daemon-long-poll/ensure', { method: 'POST' })
-    return readJsonResponse(response)
+    const payload = await readJsonResponse(response)
+    // #region debug-point H1:ensure-stub-response
+    reportDebugEvent('workers/personal-runtime/src/wechat/wechatDaemonLongPollOwner.js:ensureWechatDaemonLongPollOwner', '[DEBUG] long-poll owner ensure stub response', {
+      status: Number(response?.status || 0),
+      ok: response?.ok === true,
+      payload
+    })
+    // #endregion
+    return payload
   }
   if (ctx?.waitUntil) {
     ctx.waitUntil(run().catch((error) => {
-      console.warn('[wechat-long-poll-owner] ensure failed', error)
+      // #region debug-point H1:ensure-stub-failed
+      reportDebugEvent('workers/personal-runtime/src/wechat/wechatDaemonLongPollOwner.js:ensureWechatDaemonLongPollOwner', '[DEBUG] long-poll owner ensure stub failed', {
+        error: normalizeText(error?.message || error)
+      })
+      // #endregion
     }))
     return { ok: true, scheduled: true }
   }
@@ -191,7 +274,15 @@ export const getWechatDaemonLongPollOwnerStatus = async (env = {}) => {
   const stub = getOwnerStub(env)
   if (!stub) return { ok: false, skipped: 'missing_long_poll_owner_binding' }
   const response = await stub.fetch('https://wechat-daemon-long-poll/status')
-  return readJsonResponse(response)
+  const payload = await readJsonResponse(response)
+  // #region debug-point H1:status-stub-response
+  reportDebugEvent('workers/personal-runtime/src/wechat/wechatDaemonLongPollOwner.js:getWechatDaemonLongPollOwnerStatus', '[DEBUG] long-poll owner status stub response', {
+    status: Number(response?.status || 0),
+    ok: response?.ok === true,
+    payload
+  })
+  // #endregion
+  return payload
 }
 
 export const isWechatDaemonLongPollOwnerHealthy = async (env = {}, {
